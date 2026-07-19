@@ -1,436 +1,227 @@
-基于你的设计（可训练低频基座 + 高频Codebook补全 + 3D U-Net体素输出 + 双监督），我为你梳理了完整的实施步骤。
+# SparseViewReconstruction 模型文档
+
+基于双码本先验 + FiLM 骨架调制 + 渐进式 Mask 课程学习的稀疏 CBCT 重建。
+
+**核心目标**：从 6~10 张稀疏 X 射线投影重建 CT 体素——**解剖结构对齐 CBCT，HU 值分布对齐 pCT**。
 
 ----
 
-整体架构概览
+## 整体架构概览
 
-```text
-训练阶段 (利用491个完整投影)：
-  491张投影 → 2D CNN → 构建3D代价体 → 低频基座(FiLM调制) + 高频Codebook(残差) → 融合 → 3D U-Net → 256³体素
-                                                                                                    ↓
-                                                                                            双监督: L_CBCT + L_pCT
+```mermaid
+graph TD
+    classDef pretrain fill:#e1f5fe,stroke:#01579b,stroke-width:2px;
+    classDef finetune fill:#f3e5f5,stroke:#4a148c,stroke-width:2px;
+    classDef infer fill:#fff3e0,stroke:#e65100,stroke-width:2px;
+    classDef module fill:#e8f5e9,stroke:#1b5e20,stroke-width:2px;
+    classDef data fill:#fff9c4,stroke:#f57f17,stroke-width:2px;
+    classDef frozen fill:#ffcdd2,stroke:#c62828,stroke-width:2px,stroke-dasharray: 5 5;
 
-推理阶段 (仅6个稀疏投影)：
-  6张投影 → 2D CNN → 构建稀疏3D代价体 → 低频基座(FiLM调制) + 高频Codebook(残差) → 融合 → 3D U-Net → 256³体素
-`````
+    subgraph Stage1 [阶段一：码本预训练（全视角）]
+        direction TB
+        P1["全视角 491 张投影 + 角度编码"]:::data --> P2["2D CNN + Transformer"]:::module
+        P2 --> P3["2D→3D 可微分反投影"]:::module
+        P3 --> P4["3D 特征体素 (64³×256ch)"]:::data
+        P4 --> P5["HF 保留 64³ / MF 上采样至 128³"]:::module
+        P5 --> P6["VQ 聚类构建双码本"]:::module
+        P6 --> P7[("高频码本 H<br>1024×128")]:::data
+        P6 --> P8[("中频码本 M<br>512×64")]:::data
+        P7 --> P9["🔒 冻结码本"]:::frozen
+        P8 --> P9
+    end
+
+    subgraph Stage2 [阶段二：主网络微调（稀疏视角，码本冻结）]
+        direction TB
+        F1["混合输入：全视角→稀疏视角<br>(6~10 张) + 角度编码"]:::data --> F2["固定权重 2D CNN<br>(与阶段一共享)"]:::module
+        F2 --> F3["2D→3D 反投影"]:::module
+        F3 --> F4["3D 特征体素 (64³×256ch)"]:::data
+        F4 --> F5["HF 64³ / MF 上采样 128³"]:::module
+
+        F5 --> F6["查询冻结高频码本 H"]:::module
+        P7 -.-> F6
+        F6 --> F7["A (64³×128ch)"]:::data
+
+        F5 --> F8["查询冻结中频码本 M"]:::module
+        P8 -.-> F8
+        F8 --> F9["B (128³×64ch)"]:::data
+
+        F7 --> F10["上采样 64³→128³, 128ch→64ch"]:::module
+        F10 --> F11["高频放大至 128³×64ch"]:::data
+
+        F4 --> F12["全局平均池化 → MLP → γ/β"]:::module
+        F11 --> F14["FiLM 调制"]:::module
+        F12 --> F14
+        F14 --> F15["调制后特征 (128³×64ch)"]:::data
+
+        F15 --> F16["Add 融合 (+ B)"]:::module
+        F9 --> F16
+        F16 --> F17["融合特征 (128³×64ch)"]:::data
+
+        F17 --> F18["渐进式上采样"]:::module
+        F18 --> F19["256³×32ch"]:::data
+        F19 --> F20["→ 512³×1ch"]:::module
+        F20 --> F21["最终体素输出"]:::data
+    end
+
+    subgraph Stage3 [阶段三：极速推理（纯稀疏投影）]
+        direction TB
+        I1["稀疏视角 6~10 张 + 角度编码"]:::data --> I2["轻量级 2D CNN (固定)"]:::module
+        I2 --> I3["反投影 → 64³ 体素"]:::module
+        I3 --> I4["查询冻结码本 H + M"]:::module
+        P7 -.-> I4
+        P8 -.-> I4
+        I4 --> I5["A(64³)↑ + FiLM + Add(B)"]:::module
+        I5 --> I6["渐进上采样 → 512³"]:::module
+        I6 --> I7["512³×1ch CT 体素"]:::data
+    end
+```
+
+### 三阶段总览
+
+| 阶段 | 输入视角 | 码本状态 | 编码器状态 | 训练目标 |
+|------|---------|---------|-----------|---------|
+| 阶段一 (epoch 1~N₁) | 全视角 (491) | **可学习** | 可学习 | 构建高质量解剖码本 |
+| 阶段二 (epoch N₁+1~N) | 渐进 Mask: 全→稀疏 (6) | **🔒冻结** | 可学习 | 适应稀疏输入，微调解码器 |
+| 阶段三 (推理) | 稀疏 (6~10) | **🔒冻结** | **🔒冻结** | 纯前向快速重建 |
 
 ----
 
-📦 第一步：数据准备与预处理
+## 损失函数
 
-1.1 数据集结构
-
-```text
-dataset/
-├── train/
-│   ├── patient_001/
-│   │   ├── projections/          # 491张投影图 (角度 0°~360°)
-│   │   ├── ct_volume.nii.gz      # 规划CT (pCT) 256³
-│   │   └── cbct_volume.nii.gz    # 全视角CBCT重建 256³
-│   └── patient_002/
-│       └── ...
-├── test/
-│   └── ...
-└── meta_info.json
-````
-
-----
-
-1.2 数据预处理
+三个损失各司其职，精确控制输出的解剖结构和 HU 值分布：
 
 ```python
-# 1. 所有体素统一重采样到 256³，间距归一化 (如 1.5mm)
-# 2. CT值裁剪到 [-1000, 1000] HU，归一化到 [0, 1]
-# 3. 投影图归一化到 [0, 1]
-# 4. 生成相机参数 (角度、旋转轴、探测器几何)
+L_total = 1.0 × L_lap  +  0.3 × L_struct  +  0.1 × L_vq
 ```
 
-关键文件： ```bash meta_info.json```
+### 1. L_lap — 拉普拉斯金字塔损失（权重 1.0，主导）
 
-```json
-{
-    "train": ["patient_001", "patient_002", ...],
-    "test": ["patient_101", ...],
-    "spacing": [1.5, 1.5, 1.5],
-    "num_views": 491,
-    "angles": [0, 0.733, 1.466, ...]  // 491个角度
-}
+| 项目 | 说明 |
+|------|------|
+| **公式** | `Σᵢ ‖Pred_levelᵢ − pCT_levelᵢ‖₁` |
+| **比对对象** | **pCT**（规划 CT） |
+| **作用维度** | 🎨 **HU 值分布风格** |
+| **机制** | 将 pred 和 pCT 分别做拉普拉斯金字塔分解（levels=2），逐级计算 L1 |
+
+```
+拉普拉斯金字塔:
+  Level 0 (高频细节): residual = img − upsample(downsample(img))
+                       ↓ 捕获纹理、边缘的 HU 精度
+  Level 1 (中频骨架): downsample(img)
+                       ↓ 捕获整体亮度、窗宽窗位、组织对比度
 ```
 
-----
+> **为什么用拉普拉斯金字塔而不是直接 L2？** 直接 L2 会把高频细节和低频骨架混在一起模糊掉。金字塔分解后 HF 比 HF、MF 比 MF，形成**闭环频域监督**，确保解码器输出的高频码本特征和 pCT 的高频分量对齐。
 
-🏗️ 第二步：模型架构设计
+### 2. L_struct — 结构损失（权重 0.3，辅助）
 
-2.1 2D特征提取器 (Encoder_2D)
+| 项目 | 说明 |
+|------|------|
+| **公式** | `‖∇Pred − ∇CBCT‖₁`（三方向梯度 L1 差） |
+| **比对对象** | **CBCT**（锥束 CT 全重建） |
+| **作用维度** | 🦴 **解剖结构 / 边缘形状** |
+| **机制** | 只比较空间梯度，不比较绝对 HU 值 |
 
-```python
-class Encoder2D(nn.Module):
-    """
-    输入: [B, V, 1, 256, 256]  # V=491(训练) 或 6(推理)
-    输出: [B, V, 64, 64, 64]   # 特征图
-    """
-    def __init__(self):
-        super().__init__()
-        # 共享权重的2D CNN (处理每个视角)
-        self.cnn = nn.Sequential(
-            Conv2D(1, 32, 3, stride=1),   # 256→256
-            Conv2D(32, 64, 3, stride=2),  # 256→128
-            Conv2D(64, 64, 3, stride=2),  # 128→64
-            # ... 更多层
-        )
-    
-    def forward(self, x):
-        B, V, C, H, W = x.shape
-        x = x.view(B*V, C, H, W)
-        features = self.cnn(x)  # [B*V, 64, 64, 64]
-        return features.view(B, V, 64, 64, 64)
+```
+梯度计算:  ∂Pred/∂x − ∂CBCT/∂x  (同理 ∂y, ∂z)
+          ↓ 只看变化量，不看绝对值
+CBCT 优势: 器官边界清晰（不受锥束伪影影响边缘位置）
+CBCT 劣势: HU 值不准（散射、硬化伪影） → L_struct 不惩罚 HU 差异！
 ```
 
-2.2 3D代价体构建 (Cost Volume)
+> **为什么对 CBCT 只算梯度？** CBCT 的 HU 值被锥束伪影污染，但**边缘位置是准确的**。梯度 L1 只关心"边界在哪里"，不关心"边界处的 HU 值是多少"。
 
-```python
-def build_cost_volume(features_2d, camera_params, volume_shape=(128, 128, 128)):
-    """
-    features_2d: [B, V, 64, H_feat, W_feat]
-    camera_params: 每个视角的内外参 [B, V, 3x4]
-    
-    输出: [B, 64, 128, 128, 128] 3D特征体
-    """
-    # 1. 定义3D网格坐标
-    grid_3d = create_3d_grid(volume_shape)  # [128³, 3]
-    
-    # 2. 投影到每个2D特征图
-    for v in range(V):
-        # 3D点投影到2D坐标
-        coords_2d = project_3d_to_2d(grid_3d, camera_params[v])  # [128³, 2]
-        
-        # 双线性插值采样
-        sampled = grid_sample(features_2d[:, v, :, :, :], coords_2d)  # [B, 64, 128³]
-        
-        # 累加/方差聚合
-        volume += sampled
-    
-    return variance(volume)  # 或 mean
+### 3. L_vq — 码本损失（权重 0.1，正则）
+
+| 项目 | 说明 |
+|------|------|
+| **公式** | `‖sg[Q]−C‖² + 0.25×‖Q−sg[C]‖²` |
+| **作用** | 📚 码本学习，确保解剖原语被充分利用 |
+| **说明** | 双码本各有一个 VQ 损失，最终求和 |
+
+```
+sg[·] = stop_gradient（阻止梯度回传）
+
+码本损失:   让码本向量 C 靠近编码器输出 Q（更新码本）
+承诺损失:   让编码器输出 Q 靠近码本向量 C（更新编码器）
+           ×0.25 平衡两者更新速度
 ```
 
-2.3 低频基座 (Learnable Prior Base)
+---
 
-```python
-class LowFreqBase(nn.Module):
-    """
-    可训练的通用解剖结构基座
-    """
-    def __init__(self):
-        super().__init__()
-        # 低频基座: 存储通用形状 (例如用数据集的平均CT初始化)
-        self.base_feat = nn.Parameter(torch.randn(1, 32, 128, 128, 128))
-        
-        # 调制器: 从6张图的全局特征生成 scale 和 shift
-        self.modulator = nn.Sequential(
-            nn.Linear(6 * 64, 256),
-            nn.ReLU(),
-            nn.Linear(256, 32 * 2)  # 每个通道一个 scale 和 shift
-        )
-    
-    def forward(self, global_feat):
-        # global_feat: [B, 6*64] 从6个视角提取的全局特征
-        mod_params = self.modulator(global_feat)  # [B, 64]
-        scale, shift = mod_params.chunk(2, dim=1)  # [B, 32], [B, 32]
-        
-        # FiLM调制: 将通用基座雕琢为特定患者
-        base = self.base_feat.expand(B, -1, -1, -1, -1)  # [B, 32, 128, 128, 128]
-        base_modulated = base * scale.view(B, 32, 1, 1, 1) + shift.view(B, 32, 1, 1, 1)
-        return base_modulated
+## 损失-目标对照表
+
+| 你想要的效果 | 用什么损失 | 和谁比 | 为什么不和其他比 |
+|-------------|-----------|--------|-----------------|
+| 🦴 器官形状 = CBCT | `L_struct` (梯度 L1) | CBCT | CBCT 的 HU 不准，但边缘位置对 |
+| 🎨 HU 值 = pCT | `L_lap` (金字塔 L1) | pCT | pCT 的 HU 精准，频域分解后逐级对齐 |
+| ❌ 不用 MSE 比 CBCT | — | — | MSE 会强迫 HU 值对齐 CBCT，污染输出 |
+| ❌ 不用梯度比 pCT | — | — | pCT 和投影间没有直接几何对应关系 |
+| 📚 码本利用充分 | `L_vq` | 自身 | 防止码本坍缩（死神经元） |
+
+---
+
+## 关键设计决策
+
+| 决策 | 原因 |
+|------|------|
+| **阶段一冻结码本** | 码本存储通用解剖先验，后续不应被稀疏视角的残缺特征污染 |
+| **HF 64³ / MF 128³** | HF 小尺寸存细节纹理，MF 大尺寸存器官轮廓骨架 |
+| **先上采样再 FiLM** | 避免特征维度错位导致的伪影 |
+| **Add 融合而非 Concat** | 通道数不翻倍，显存减半 |
+| **渐进式 Mask（非切换）** | 网络从 Day1 就在学"补全"，避免 Catastrophic Forgetting |
+| **3D 全局池化 → FiLM 条件** | 用整体风格向量调制局部特征，比逐像素调制更鲁棒 |
+
+---
+
+## 关键超参数
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| `stage1_epochs` | 100 | 阶段一（码本预训练）持续 epoch 数 |
+| `train_views` / `max_views` | 6 / 48 | 最少/最多保留视角数 |
+| `target_keep` | 0.012 | 最终保留比例 (~6/491) |
+| `n_decoder_ups` | 1→256³, 2→512³ | 解码器上采样次数 |
+| `w_lap` / `w_struct` / `w_vq` | 1.0 / 0.3 / 0.1 | 损失权重 |
+| LR | 1e-4 | AdamW + CosineAnnealing |
+| Batch Size | 1 | 3D 模型显存限制 |
+| AMP | True | fp16 混合精度 |
+
+---
+
+## 文件结构
+
+```
+LightningRecon/
+├── src/
+│   ├── models.py      # MultiScaleCNN2D, ViewTransformer, BackProjection3D,
+│   │                    Codebook(HF+MF), FiLMBlock3D, ProgressiveDecoder,
+│   │                    SparseViewReconstruction (6.3M params)
+│   ├── losses.py      # laplacian_pyramid_loss, structural_loss, ReconstructionLoss
+│   ├── dataset.py     # PairedCBCTDataset
+│   ├── train.py       # 三阶段训练 + 渐进Mask + AMP + checkpoint
+│   └── inference.py   # 端到端推理
+├── data/paired/       # → DeepSparse/data/paired
+├── logs/              # 训练日志 + TensorBoard + checkpoint
+└── mymodel.md         # 本文档
 ```
 
-2.4 高频Codebook (残差补全)
+### 命令
 
-```python
-class HighFreqCodebook(nn.Module):
-    """
-    补全稀疏视角无法覆盖的高频细节 (骨骼边缘、血管纹理)
-    """
-    def __init__(self, num_embeddings=1024, embedding_dim=64):
-        super().__init__()
-        self.codebook = nn.Embedding(num_embeddings, embedding_dim)
-        self.encoder = nn.Conv3d(64, num_embeddings, kernel_size=1)
-        self.decoder = nn.Conv3d(embedding_dim, 32, kernel_size=1)  # 输出32通道残差
-    
-    def forward(self, volume_raw):
-        # volume_raw: [B, 64, 128, 128, 128] 从代价体直接提取的稀疏3D特征
-        
-        # 1. 编码为码本索引
-        logits = self.encoder(volume_raw)  # [B, 1024, 128, 128, 128]
-        indices = logits.argmax(dim=1)      # [B, 128, 128, 128]
-        
-        # 2. 查表
-        z_q = self.codebook(indices)        # [B, 128, 128, 128, 64]
-        z_q = z_q.permute(0, 4, 1, 2, 3)    # [B, 64, 128, 128, 128]
-        
-        # 3. STE直通 (反向传播时跳过量化)
-        z_q = volume_raw + (z_q - volume_raw).detach()
-        
-        # 4. 解码为残差 (高频细节)
-        residual = self.decoder(z_q)         # [B, 32, 128, 128, 128]
-        return residual
+```bash
+# 训练 (256³ 输出, 8GB 显卡)
+python src/train.py --data_root data/paired --epochs 400 \
+    --stage1_epochs 100 --n_decoder_ups 1 --max_views 24
+
+# 训练 (512³ 输出, ≥16GB 显卡)
+python src/train.py --data_root data/paired --epochs 400 \
+    --stage1_epochs 100 --n_decoder_ups 2 --max_views 48
+
+# 推理
+python src/inference.py \
+    --checkpoint logs/thorax_6view/best_model.pth \
+    --data_root data/paired --case_id CASE_ID --n_views 6
+
+# TensorBoard
+tensorboard --logdir logs/
 ```
-
-2.5 3D U-Net (体素解码器)
-
-```python
-class UNet3D(nn.Module):
-    """
-    输入: [B, 64, 128, 128, 128] (低频32 + 高频32)
-    输出: [B, 1, 256, 256, 256] (HU值体素)
-    """
-    def __init__(self):
-        super().__init__()
-        # 编码器 (下采样)
-        self.enc1 = ConvBlock(64, 128)    # 128→64
-        self.enc2 = ConvBlock(128, 256)   # 64→32
-        self.enc3 = ConvBlock(256, 512)   # 32→16
-        
-        # 解码器 (上采样 + 跳跃连接)
-        self.dec3 = ConvBlock(512+256, 256)  # 16→32
-        self.dec2 = ConvBlock(256+128, 128)  # 32→64
-        self.dec1 = ConvBlock(128+64, 64)    # 64→128
-        
-        # 输出头
-        self.head = nn.Conv3d(64, 1, kernel_size=1)
-        
-        # 上采样层
-        self.up = nn.Upsample(scale_factor=2, mode='trilinear', align_corners=False)
-    
-    def forward(self, x):
-        # x: [B, 64, 128, 128, 128]
-        e1 = self.enc1(x)   # [B, 128, 64, 64, 64]
-        e2 = self.enc2(e1)  # [B, 256, 32, 32, 32]
-        e3 = self.enc3(e2)  # [B, 512, 16, 16, 16]
-        
-        d3 = self.dec3(torch.cat([self.up(e3), e2], dim=1))  # [B, 256, 32, 32, 32]
-        d2 = self.dec2(torch.cat([self.up(d3), e1], dim=1))  # [B, 128, 64, 64, 64]
-        d1 = self.dec1(torch.cat([self.up(d2), x], dim=1))   # [B, 64, 128, 128, 128]
-        
-        # 上采样到 256³
-        out = self.up(d1)    # [B, 64, 256, 256, 256]
-        out = self.head(out) # [B, 1, 256, 256, 256]
-        return out
-```
-
-2.6 完整模型 (组装所有组件)
-
-```python
-class SparseViewReconstruction(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.encoder_2d = Encoder2D()
-        self.low_freq_base = LowFreqBase()
-        self.high_freq_codebook = HighFreqCodebook()
-        self.unet_3d = UNet3D()
-        
-    def forward(self, projs, camera_params, is_train=True):
-        # projs: [B, V, 1, 256, 256]  V=491(训练) 或 6(推理)
-        
-        # 1. 2D特征提取
-        features_2d = self.encoder_2d(projs)  # [B, V, 64, 64, 64]
-        
-        # 2. 构建3D代价体 (只取前6个视图作为条件输入)
-        V_cond = 6  # 始终用6个视图作为条件
-        volume_raw = build_cost_volume(
-            features_2d[:, :V_cond, :, :, :], 
-            camera_params[:, :V_cond, :, :]
-        )  # [B, 64, 128, 128, 128]
-        
-        # 3. 低频基座 (通过6个视图的全局特征调制)
-        global_feat = features_2d[:, :V_cond, :, :, :].mean(dim=[2,3,4]).flatten(1)  # [B, 6*64]
-        low_freq = self.low_freq_base(global_feat)  # [B, 32, 128, 128, 128]
-        
-        # 4. 高频Codebook残差
-        high_freq = self.high_freq_codebook(volume_raw)  # [B, 32, 128, 128, 128]
-        
-        # 5. 融合特征
-        fused_features = torch.cat([low_freq, high_freq], dim=1)  # [B, 64, 128, 128, 128]
-        
-        # 6. 3D U-Net解码
-        volume_pred = self.unet_3d(fused_features)  # [B, 1, 256, 256, 256]
-        
-        return volume_pred, low_freq, high_freq, volume_raw
-```
-
-----
-
-🎯 第三步：损失函数设计 (双监督)
-
-3.1 解剖结构一致性损失 (CBCT监督)
-
-```python
-def cbct_consistency_loss(pred, cbct_gt):
-    """
-    确保生成的体素在解剖结构上与全视角CBCT一致
-    """
-    # 1. SSIM损失 (关注结构)
-    ssim_loss = 1 - ssim(pred, cbct_gt, data_range=1.0)
-    
-    # 2. 感知损失 (使用预训练的3D CNN提取特征)
-    percep_loss = perceptual_loss(pred, cbct_gt)
-    
-    # 3. 梯度损失 (边缘一致性)
-    grad_loss = torch.mean(torch.abs(gradient(pred) - gradient(cbct_gt)))
-    
-    return ssim_loss + 0.1 * percep_loss + 0.05 * grad_loss
-```
-
-3.2 CT值准确性损失 (pCT监督)
-
-```python
-def pct_accuracy_loss(pred, pct_gt):
-    """
-    确保生成的体素在HU值分布上与规划CT接近
-    """
-    # 1. MSE损失 (数值精度)
-    mse_loss = torch.mean((pred - pct_gt) ** 2)
-    
-    # 2. 直方图匹配损失 (全局分布一致性)
-    hist_loss = histogram_matching_loss(pred, pct_gt)
-    
-    # 3. 感知损失 (在HU值域上的感知)
-    percep_loss = perceptual_loss(pred, pct_gt)
-    
-    return mse_loss + 0.1 * hist_loss + 0.05 * percep_loss
-```
-
-3.3 总损失
-
-```python
-def total_loss(volume_pred, cbct_gt, pct_gt, low_freq, high_freq, volume_raw):
-    # 1. 双监督损失
-    L_cbct = cbct_consistency_loss(volume_pred, cbct_gt)
-    L_pct = pct_accuracy_loss(volume_pred, pct_gt)
-    
-    # 2. 辅助正则化损失
-    # 2a. 低频基座平滑性 (防止过拟合)
-    L_smooth = total_variation(low_freq)
-    
-    # 2b. 高频Codebook使用均匀性 (perplexity)
-    L_perplexity = codebook_perplexity(high_freq)
-    
-    # 2c. 稀疏代价体的稀疏性约束
-    L_sparse = torch.norm(volume_raw, p=1)
-    
-    # 3. 总损失
-    L_total = L_cbct + L_pct + 0.01 * L_smooth + 0.1 * L_perplexity + 0.001 * L_sparse
-    return L_total
-```
-
-----
-
-🚀 第四步：训练策略
-
-4.1 训练循环 (伪代码)
-
-```python
-model = SparseViewReconstruction().cuda()
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
-
-for epoch in range(num_epochs):
-    for batch in dataloader_train:
-        # batch包含: projs [B, 491, 1, 256, 256], camera_params [B, 491, 3, 4], 
-        #           cbct_gt [B, 1, 256, 256, 256], pct_gt [B, 1, 256, 256, 256]
-        
-        # 前向传播 (只用前6个视角作为条件)
-        volume_pred, low_freq, high_freq, volume_raw = model(
-            projs[:, :6, :, :, :],  # 只取6个view
-            camera_params[:, :6, :, :]
-        )
-        
-        # 计算损失 (使用全视角的CBCT和pCT作为监督)
-        loss = total_loss(volume_pred, cbct_gt, pct_gt, low_freq, high_freq, volume_raw)
-        
-        # 反向传播
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        optimizer.zero_grad()
-```
-4.2 渐进式训练策略
-
-```python
-# 阶段1 (0-50 epochs): 只使用CBCT监督 (让网络先学解剖结构)
-L_total = L_cbct + 0.01 * L_smooth
-
-# 阶段2 (50-100 epochs): 引入pCT监督 (开始校正CT值)
-L_total = L_cbct + 0.5 * L_pct + 0.01 * L_smooth
-
-# 阶段3 (100-300 epochs): 完整损失 (微调)
-L_total = L_cbct + L_pct + 0.01 * L_smooth + 0.1 * L_perplexity
-
-# 阶段4 (300+ epochs): 冻结低频基座，微调其余部分
-low_freq_base.base_feat.requires_grad = False
-```
-
-----
-
-🧪 第五步：推理流程
-
-```python
-def inference(model, projs_6view, camera_params_6view):
-    """
-    输入: 6个稀疏视图 (新病人)
-    输出: 256³ 体素 (快速推理 < 1秒)
-    """
-    model.eval()
-    with torch.no_grad():
-        volume_pred, _, _, _ = model(projs_6view, camera_params_6view)
-    return volume_pred  # [1, 1, 256, 256, 256]
-```
-
-----
-
-📊 第六步：评估指标
-
-```python
-def evaluate(volume_pred, volume_gt):
-    # 1. PSNR (峰值信噪比)
-    psnr = compute_psnr(volume_pred, volume_gt)
-    
-    # 2. SSIM (结构相似性)
-    ssim = compute_ssim(volume_pred, volume_gt)
-    
-    # 3. MAE (平均绝对误差) - 关注CT值准确性
-    mae = torch.mean(torch.abs(volume_pred - volume_gt))
-    
-    # 4. HU值直方图相似度
-    hist_sim = histogram_similarity(volume_pred, volume_gt)
-    
-    return {'PSNR': psnr, 'SSIM': ssim, 'MAE': mae, 'HistSim': hist_sim}
-```
-
-----
-
-💡 第七步：关键超参数参考
-
-|参数|推荐值|说明|
-|----|----|----|
-|Learning Rate|1e-4|AdamW优化器|
-|Batch Size|2|32G显存|
-|Codebook Size|1024|高频细节容量|
-|Codebook Dim|64|特征维度|
-|低频基座通道|32|64³和128³分别设|
-|权重衰减|1e-5|防止过拟合|
-|梯度裁剪|1.0|稳定训练|
-|总训练轮数|300-500|视收敛情况|
-
-----
-
-📝 实施建议
-
-1. 基座初始化: 用训练集中所有病人的平均CT体素初始化 base_feat，可以极大加速收敛。
-2. 数据增强: 训练时随机裁剪、旋转、添加高斯噪声，提升泛化能力。
-3. 分阶段训练: 严格按照上述渐进式策略，先学结构再学细节。
-4. 监控指标: 每5个epoch在验证集上计算PSNR/SSIM，选最佳模型。
-5. 显存优化: 如果32G不够，可以：
-    - 使用梯度累积 (accumulation)
-    - 减小batch size到1
-    - 使用混合精度训练 (AMP)
-
-这个方案从数据准备到推理部署形成了一个完整的闭环，且每个组件都有明确的输入输出定义。如果需要我展开某个模块的具体代码实现，随时告诉我。

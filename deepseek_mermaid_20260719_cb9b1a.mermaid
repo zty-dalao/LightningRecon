@@ -1,0 +1,104 @@
+graph TD
+    %% 定义样式
+    classDef pretrain fill:#e1f5fe,stroke:#01579b,stroke-width:2px;
+    classDef finetune fill:#f3e5f5,stroke:#4a148c,stroke-width:2px;
+    classDef infer fill:#fff3e0,stroke:#e65100,stroke-width:2px;
+    classDef module fill:#e8f5e9,stroke:#1b5e20,stroke-width:2px;
+    classDef data fill:#fff9c4,stroke:#f57f17,stroke-width:2px;
+    classDef frozen fill:#ffcdd2,stroke:#c62828,stroke-width:2px,stroke-dasharray: 5 5;
+
+    %% ================= 阶段一：码本预训练（全视角，固定几何） =================
+    subgraph Stage1_Codebook_Pretrain [阶段一：离线码本预训练（全视角，训练慢，可接受）]
+        direction TB
+        P1[全视角 491 张投影 + 角度编码图]:::data --> P2[2D CNN + Transformer<br>提取多频2D特征]:::module
+        
+        P2 --> P3[2D→3D 可微分反投影层<br>（基于FDK几何，严格物理约束）]:::module
+        P3 --> P4[生成临时3D特征体素<br>（64³ × 256ch）]:::data
+        
+        P4 --> P5[高频/中频特征分离<br>（高频保留64³，中频上采样至128³）]:::module
+        
+        P5 --> P6[构建离散双码本<br>（VQ-VAE / K-Means聚类）]:::module
+        P6 --> P7[(高频码本 H<br>64³×128ch)]:::data
+        P6 --> P8[(中频码本 M<br>128³×64ch)]:::data
+        
+        P7 --> P9[🔒 冻结码本<br>（参数固定，永不更新）]:::frozen
+        P8 --> P9
+    end
+
+    %% ================= 阶段二：主网络微调（稀疏视角，码本冻结） =================
+    subgraph Stage2_MainNet_Tuning [阶段二：主网络微调（输入逐步引入稀疏视角，码本冻结）]
+        direction TB
+        F1[混合输入：全视角逐步过渡到稀疏视角<br>（6~10张）+ 角度编码图]:::data --> F2[固定权重的 2D CNN<br>（与阶段一编码器共享权重）]:::module
+        
+        F2 --> F3[2D→3D 可微分反投影层<br>（几何对齐，保证空间一致性）]:::module
+        F3 --> F4[生成当前3D特征体素<br>（64³ × 256ch）]:::data
+
+        F4 --> F5[分离高频/中频查询特征<br>（高频走64³，中频上采样至128³）]:::module
+
+        F5 --> F6[查询冻结的高频码本 H]:::module
+        P7 -.->|加载冻结| F6
+        F6 --> F7[高频拼接 A<br>（64³ × 128ch）]:::data
+
+        F5 --> F8[查询冻结的中频码本 M]:::module
+        P8 -.->|加载冻结| F8
+        F8 --> F9[中频拼接 B<br>（128³ × 64ch）]:::data
+
+        %% 隐患一修复：先上采样后调制
+        F7 --> F10[上采样（PixelShuffle）<br>64³ → 128³, 128ch → 64ch]:::module
+        F10 --> F11[高频细节放大至 128³ × 64ch]:::data
+
+        %% 缺陷三修复：全局池化生成FiLM条件
+        F4 --> F12[全局平均池化<br>（压缩3D体素为全局风格向量）]:::module
+        F12 --> F13[MLP 生成 γ/β<br>（维度：64ch）]:::module
+
+        %% 隐患二修复：用FiLM替代Concat（相加融合）
+        F11 --> F14[FiLM 调制器<br>γ/β 作用于高频放大特征]:::module
+        F13 --> F14
+        F14 --> F15[调制后特征<br>（128³ × 64ch）]:::data
+
+        F15 --> F16[Add 融合<br>（调制后特征 + 中频拼接 B）]:::module
+        F9 --> F16
+        F16 --> F17[融合特征<br>（128³ × 64ch，注意：无通道倍增，显存减半）]:::data
+
+        F17 --> F18[渐进式上采样<br>（PixelShuffle）]:::module
+        F18 --> F19[输出 256³ × 32ch]:::data
+        F19 --> F20[最终上采样<br>→ 512³ × 1ch]:::module
+        F20 --> F21[最终体素输出]:::data
+    end
+
+    %% ================= 阶段三：极速推理（纯稀疏视角，纯前向） =================
+    subgraph Stage3_Inference [阶段三：极速推理（实际部署）]
+        direction TB
+        I1[稀疏视角 6~10 张投影 + 角度编码]:::data --> I2[轻量级 2D CNN<br>（权重固定）]:::module
+        I2 --> I3[2D→3D 反投影]:::module
+        I3 --> I4[3D特征体素 64³]:::data
+
+        I4 --> I5[查询冻结的高频码本 H]:::module
+        I4 --> I6[查询冻结的中频码本 M]:::module
+        P7 -.-> I5
+        P8 -.-> I6
+
+        I5 --> I7[A（64³×128ch）]:::data
+        I6 --> I8[B（128³×64ch）]:::data
+
+        I7 --> I9[上采样至 128³×64ch]:::module
+        I9 --> I10[高频细节]:::data
+
+        I4 --> I11[全局池化 → MLP<br>生成 γ/β]:::module
+        I10 --> I12[FiLM 调制]:::module
+        I11 --> I12
+        I12 --> I13[调制后特征]:::data
+
+        I13 --> I14[Add 融合（+ B）]:::module
+        I8 --> I14
+
+        I14 --> I15[渐进 PixelShuffle 上采样<br>128³ → 256³ → 512³]:::module
+        I15 --> I16[输出 512³ × 1ch 体素]:::data
+    end
+
+    %% 跨阶段依赖
+    P7 -.->|作为固化的先验知识| I5
+    P8 -.->|作为固化的先验知识| I6
+    P7 -.-> F6
+    P8 -.-> F8
+    F2 -.->|共享权重| I2
