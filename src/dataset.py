@@ -1,7 +1,7 @@
 """
-数据集加载器: 从 paired/ 目录加载 CBCT 投影、CBCT 重建体和 pCT 体素。
+数据集加载器: 从 thorax_fast/ 目录加载 CBCT 投影、CBCT 重建体和 pCT 体素。
 
-目录结构 (data/paired/):
+目录结构 (data/thorax_fast/):
   projection_npy/{case_id}/Proj_00000.npy ... Proj_00490.npy  ← 491 张投影 (320,1280) float32
   cbct/{case_id}.nii.gz                                       ← CBCT 重建体 (512,512,110)
   ct/{case_id}.nii.gz                                         ← pCT 标签体 (512,512,110)
@@ -25,7 +25,7 @@ class PairedCBCTDataset(Dataset):
       - ct_vol:   (D, H, W) 规划 CT (pCT) 体素标签
 
     Args:
-        data_root:     paired/ 目录的绝对路径
+        data_root:     thorax_fast/ 目录的绝对路径
         split:         'train' | 'val' | 'test' — 数据集划分
         n_views:       加载的投影数量 (训练=491, 推理可≤6)
         proj_size:     投影图 resize 目标 (H, W)，默认 (256, 256)
@@ -37,7 +37,7 @@ class PairedCBCTDataset(Dataset):
 
     def __init__(
         self,
-        data_root,                                                # paired/ 根目录路径
+        data_root,                                                # thorax_fast/ 根目录路径
         split='train',                                            # 数据集划分: train/val/test
         n_views=491,                                              # 每样本加载投影数
         proj_size=(256, 256),                                     # 投影 resize 目标 (H, W)
@@ -67,7 +67,7 @@ class PairedCBCTDataset(Dataset):
                          (ct_dir, 'ct')]:
             if not os.path.isdir(d):                              # 目录不存在
                 raise FileNotFoundError(
-                    f'缺少数据目录: {d}。请确认 paired/ 下包含 '
+                    f'缺少数据目录: {d}。请确认 thorax_fast/ 下包含 '
                     f'projection_npy/、cbct/、ct/ 三个子目录。'
                 )
 
@@ -278,7 +278,7 @@ class PairedCBCTDataset(Dataset):
 # =====================================================================
 
 if __name__ == '__main__':
-    data_root = '/home/zty20020112/workspace/LightningRecon/data/paired'  # 默认数据路径
+    data_root = '/home/zty20020112/workspace/LightningRecon/data/thorax_fast'  # 默认数据路径
 
     print('=' * 60)
     print('测试 PairedCBCTDataset')
