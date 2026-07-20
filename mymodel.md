@@ -201,7 +201,7 @@ LightningRecon/
 │   ├── dataset.py     # PairedCBCTDataset
 │   ├── train.py       # 三阶段训练 + 渐进Mask + AMP + checkpoint
 │   └── inference.py   # 端到端推理
-├── data/paired/       # → DeepSparse/data/paired
+├── data/thorax_fast/       # → DeepSparse/data/thorax_fast
 ├── logs/              # 训练日志 + TensorBoard + checkpoint
 └── mymodel.md         # 本文档
 ```
@@ -210,17 +210,17 @@ LightningRecon/
 
 ```bash
 # 训练 (256³ 输出, 8GB 显卡)
-python src/train.py --data_root data/paired --epochs 400 \
+python src/train.py --data_root data/thorax_fast --epochs 400 \
     --stage1_epochs 100 --n_decoder_ups 1 --max_views 24
 
 # 训练 (512³ 输出, ≥16GB 显卡)
-python src/train.py --data_root data/paired --epochs 400 \
+python src/train.py --data_root data/thorax_fast --epochs 400 \
     --stage1_epochs 100 --n_decoder_ups 2 --max_views 48
 
 # 推理
 python src/inference.py \
     --checkpoint logs/thorax_6view/best_model.pth \
-    --data_root data/paired --case_id CASE_ID --n_views 6
+    --data_root data/thorax_fast --case_id CASE_ID --n_views 6
 
 # TensorBoard
 tensorboard --logdir logs/

@@ -4,7 +4,7 @@
 阶段1 (前 stage1_epochs): 全视角, 训练全部权重
 阶段2 (剩余 epoch):      冻结码本, 渐进Mask微调
 
-用法: python src/train.py --data_root data/paired --epochs 400 --stage1_epochs 100
+用法: python src/train.py --data_root data/thorax_fast --epochs 400 --stage1_epochs 100
 """
 
 import os, sys, argparse, json
@@ -141,7 +141,7 @@ if __name__ == '__main__':
     p = argparse.ArgumentParser()
     p.add_argument('--data_root', type=str, required=True)
     p.add_argument('--vol_size', type=int, nargs=3, default=(128,128,128))
-    p.add_argument('--organ', type=str, default='thorax')
+    p.add_argument('--organ', type=str, default='thorax_fast')
     p.add_argument('--train_views', type=int, default=6)
     p.add_argument('--max_views', type=int, default=48)
     p.add_argument('--target_keep', type=float, default=0.012)

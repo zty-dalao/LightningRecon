@@ -6,7 +6,7 @@
 
 用法:
   python src/inference.py --checkpoint logs/thorax_6view/best_model.pth \
-      --data_root data/paired --case_id CASE --n_views 6 --output recon.nii.gz
+      --data_root data/thorax_fast --case_id CASE --n_views 6 --output recon.nii.gz
 """
 
 import os, sys, argparse
