@@ -211,7 +211,7 @@ LightningRecon/
 ```bash
 # 训练 (256³ 输出, 8GB 显卡)
 python src/train.py --data_root data/thorax_fast --epochs 400 \
-    --stage1_epochs 100 --n_decoder_ups 1 --max_views 24
+    --vol_size 256 256 256 --stage1_epochs 100 --n_decoder_ups 1 --max_views 24
 
 # 训练 (512³ 输出, ≥16GB 显卡)
 python src/train.py --data_root data/thorax_fast --epochs 400 \
