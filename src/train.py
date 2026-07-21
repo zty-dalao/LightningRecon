@@ -11,7 +11,7 @@ import os, sys, argparse, json
 import torch, torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.models import SparseViewReconstruction
@@ -61,7 +61,7 @@ def train(args):
     criterion = ReconstructionLoss(w_lap=args.w_lap, w_struct=args.w_struct, w_vq=args.w_vq)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
-    scaler = GradScaler() if args.amp else None
+    scaler = GradScaler('cuda') if args.amp else None
 
     organ = getattr(args, 'organ', 'thorax')
     log_dir = os.path.join(args.log_dir, f'{organ}_{args.train_views}view')
@@ -98,7 +98,7 @@ def train(args):
 
             opt.zero_grad()
             if args.amp:
-                with autocast():
+                with autocast('cuda'):
                     pred, vq, _ = model(projs_enc)
                     ct_a = nn.functional.interpolate(ct, size=pred.shape[2:], mode='trilinear')
                     cbct_a = nn.functional.interpolate(cbct, size=pred.shape[2:], mode='trilinear')
