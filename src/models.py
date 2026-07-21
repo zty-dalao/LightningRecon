@@ -166,7 +166,7 @@ class Codebook(nn.Module):
         for s in range(0, Nq, CH):
             e = min(s+CH, Nq)
             dot = torch.matmul(q_f[s:e], cb_f.t())
-            idx[s:e] = (qn2[s:e] + cn2.unsqueeze(0) - 2*dot).argmax(dim=-1)  # 负距离 = -dist, argmax = argmin
+            idx[s:e] = (qn2[s:e] + cn2.unsqueeze(0) - 2*dot).argmin(dim=-1)
         fc = self.cb(idx).to(q.dtype)                               # 回到原精度
         enc = F.one_hot(idx, self.N).float(); avg = enc.mean(dim=0)
         perp = torch.exp(-torch.sum(avg*torch.log(avg+1e-10)))
