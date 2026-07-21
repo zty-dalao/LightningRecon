@@ -208,10 +208,10 @@ class ProgressiveDecoder(nn.Module):
         super().__init__()
         self.hf_up = UpBlock3D(hf_ch, mf_ch)                        # 64³→128³
         self.film = FiLMBlock3D(mf_ch, mf_ch)
-        # 可配置的上采样链
+        # 可配置的上采样链 (ch//4 通道压缩，适配 512³ 显存)
         ups = []; ch = mf_ch
         for i in range(n_ups):
-            next_ch = max(8, ch // 2)
+            next_ch = max(4, ch // 4)
             ups.append(UpBlock3D(ch, next_ch))
             ch = next_ch
         self.ups = nn.ModuleList(ups)

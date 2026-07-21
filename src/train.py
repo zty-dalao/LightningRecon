@@ -11,7 +11,7 @@ import os, sys, argparse, json
 import torch, torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from torch.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler, autocast
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.models import SparseViewReconstruction
@@ -61,10 +61,11 @@ def train(args):
     criterion = ReconstructionLoss(w_lap=args.w_lap, w_struct=args.w_struct, w_vq=args.w_vq)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
-    scaler = GradScaler('cuda') if args.amp else None
+    scaler = GradScaler() if args.amp else None
 
     organ = getattr(args, 'organ', 'thorax')
-    log_dir = os.path.join(args.log_dir, f'{organ}_{args.train_views}view')
+    out_res = 128 * (2 ** args.n_decoder_ups)                        # 128→256 or 128→512
+    log_dir = os.path.join(args.log_dir, f'{organ}_{args.train_views}view_{out_res}')
     os.makedirs(log_dir, exist_ok=True)
     writer = SummaryWriter(os.path.join(log_dir, 'tensorboard'))
     json.dump(vars(args)|{'train_cases':len(ts)}, open(os.path.join(log_dir,'config.json'),'w'), indent=2)
@@ -98,7 +99,7 @@ def train(args):
 
             opt.zero_grad()
             if args.amp:
-                with autocast('cuda'):
+                with autocast():
                     pred, vq, _ = model(projs_enc)
                     ct_a = nn.functional.interpolate(ct, size=pred.shape[2:], mode='trilinear')
                     cbct_a = nn.functional.interpolate(cbct, size=pred.shape[2:], mode='trilinear')
