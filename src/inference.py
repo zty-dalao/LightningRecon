@@ -2,11 +2,11 @@
 推理脚本: 从稀疏投影直接重建 CT 体素。
 
 流程:
-  稀疏投影 + 角度编码 → CNN → Transformer → 双码本 → 渐进解码 → 256³ NIfTI
+  稀疏投影 + 角度编码 → CNN → Transformer → 双码本 → 渐进解码 → NIfTI
 
 用法:
-  python src/inference.py --checkpoint logs/thorax_6view/best_model.pth \
-      --data_root data/thorax_fast --case_id CASE --n_views 6 --output recon.nii.gz
+  python src/inference.py --checkpoint logs/thorax_fast_6view_256/best_model.pth \
+      --data_root ~/autodl-tmp/thorax --case_id 2026-06-04_065713 --n_views 6 --output recon.nii.gz
 """
 
 import os, sys, argparse
@@ -16,7 +16,7 @@ import nibabel as nib
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.models import SparseViewReconstruction
-from src.dataset import PairedCBCTDataset
+from src.dataset import ThoraxCTDataset
 
 
 def add_angle_encoding(projs, device):
@@ -57,7 +57,7 @@ def reconstruct_single(model, dataset, case_id, device, n_views=6,
     return volume.astype(np.float32)
 
 
-def save_nifti(volume, path, spacing=(0.98, 0.98, 2.0)):
+def save_nifti(volume, path, spacing=(2.0, 2.0, 2.0)):
     vol = np.transpose(volume, (2, 1, 0))
     aff = np.eye(4)
     aff[0,0], aff[1,1], aff[2,2] = spacing
@@ -69,10 +69,10 @@ def inference(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = load_model(args.checkpoint, device)
     n_views = args.n_views or 6
-    dataset = PairedCBCTDataset(data_root=args.data_root,
-                                split=args.split if args.case_id is None else 'test',
-                                n_views=n_views, proj_size=(256, 256),
-                                vol_size=(128, 128, 128))
+    dataset = ThoraxCTDataset(data_root=args.data_root,
+                             split=args.split if args.case_id is None else 'test',
+                             n_views=n_views, proj_size=(256, 256),
+                             vol_size=(128, 128, 128))
     print(f'Dataset: {len(dataset)} cases, {n_views} views')
 
     if args.case_id:

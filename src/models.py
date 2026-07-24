@@ -75,7 +75,7 @@ class UpBlock3D(nn.Module):
 # =========================================================================
 
 class MultiScaleCNN2D(nn.Module):
-    """256² → 128² → 64² (保持), 输出 feat(64², 256ch)"""
+    """自适应下采样 (2× stride=2), 输出 feat(H/4×W/4, 256ch)"""
     def __init__(self, in_ch=3, base_ch=32):
         super().__init__()
         self.stem = nn.Sequential(ConvBlock2D(in_ch, base_ch, 7, 1, 3), ResBlock2D(base_ch))
@@ -86,8 +86,9 @@ class MultiScaleCNN2D(nn.Module):
     def forward(self, x):
         B, V = x.shape[:2]
         x = x.reshape(B * V, *x.shape[2:])
-        x = self.enc3(self.enc2(self.enc1(self.stem(x))))           # (B*V, 256, 64, 64)
-        return x.reshape(B, V, 256, 64, 64)
+        x = self.enc3(self.enc2(self.enc1(self.stem(x))))           # (B*V, 256, H/4, W/4)
+        _, C, H, W = x.shape
+        return x.reshape(B, V, C, H, W)
 
 
 # =========================================================================

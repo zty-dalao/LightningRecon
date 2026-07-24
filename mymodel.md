@@ -2,7 +2,7 @@
 
 基于双码本先验 + FiLM 骨架调制 + 渐进式 Mask 课程学习的稀疏 CBCT 重建。
 
-**核心目标**：从 6~10 张稀疏 X 射线投影重建 CT 体素——**解剖结构对齐 CBCT，HU 值分布对齐 pCT**。
+**核心目标**：从 6~10 张稀疏 X 射线投影重建 CT 体素——**解剖结构和 HU 值分布均对齐 pCT**。
 
 ----
 
@@ -117,19 +117,18 @@ L_total = 1.0 × L_lap  +  0.3 × L_struct  +  0.1 × L_vq
 
 | 项目 | 说明 |
 |------|------|
-| **公式** | `‖∇Pred − ∇CBCT‖₁`（三方向梯度 L1 差） |
-| **比对对象** | **CBCT**（锥束 CT 全重建） |
+| **公式** | `‖∇Pred − ∇CT‖₁`（三方向梯度 L1 差） |
+| **比对对象** | **CT**（规划 CT） |
 | **作用维度** | 🦴 **解剖结构 / 边缘形状** |
 | **机制** | 只比较空间梯度，不比较绝对 HU 值 |
 
 ```
-梯度计算:  ∂Pred/∂x − ∂CBCT/∂x  (同理 ∂y, ∂z)
+梯度计算:  ∂Pred/∂x − ∂CT/∂x  (同理 ∂y, ∂z)
           ↓ 只看变化量，不看绝对值
-CBCT 优势: 器官边界清晰（不受锥束伪影影响边缘位置）
-CBCT 劣势: HU 值不准（散射、硬化伪影） → L_struct 不惩罚 HU 差异！
+CT 优势: 器官边界清晰，HU 值精准
 ```
 
-> **为什么对 CBCT 只算梯度？** CBCT 的 HU 值被锥束伪影污染，但**边缘位置是准确的**。梯度 L1 只关心"边界在哪里"，不关心"边界处的 HU 值是多少"。
+> **为什么对 CT 只算梯度？** 梯度 L1 只关心"边界在哪里"，结合 L_lap 的 HU 值监督，形成互补：L_lap 负责"边界处的 HU 值是多少"，L_struct 负责"边界位置对不对"。
 
 ### 3. L_vq — 码本损失（权重 0.1，正则）
 
@@ -153,10 +152,8 @@ sg[·] = stop_gradient（阻止梯度回传）
 
 | 你想要的效果 | 用什么损失 | 和谁比 | 为什么不和其他比 |
 |-------------|-----------|--------|-----------------|
-| 🦴 器官形状 = CBCT | `L_struct` (梯度 L1) | CBCT | CBCT 的 HU 不准，但边缘位置对 |
-| 🎨 HU 值 = pCT | `L_lap` (金字塔 L1) | pCT | pCT 的 HU 精准，频域分解后逐级对齐 |
-| ❌ 不用 MSE 比 CBCT | — | — | MSE 会强迫 HU 值对齐 CBCT，污染输出 |
-| ❌ 不用梯度比 pCT | — | — | pCT 和投影间没有直接几何对应关系 |
+| 🦴 器官形状 = CT | `L_struct` (梯度 L1) | CT | 梯度 L1 只关心边缘位置，和 L_lap 互补 |
+| 🎨 HU 值 = CT | `L_lap` (金字塔 L1) | CT | 频域分解后 HF/HF、MF/MF 逐级对齐，精准控制 HU |
 | 📚 码本利用充分 | `L_vq` | 自身 | 防止码本坍缩（死神经元） |
 
 ---
@@ -167,6 +164,7 @@ sg[·] = stop_gradient（阻止梯度回传）
 |------|------|
 | **阶段一冻结码本** | 码本存储通用解剖先验，后续不应被稀疏视角的残缺特征污染 |
 | **HF 64³ / MF 128³** | HF 小尺寸存细节纹理，MF 大尺寸存器官轮廓骨架 |
+| **L_lap + L_struct 都用 CT** | 不再使用 CBCT，CT 同时提供精准 HU 和清晰边缘，双损失互补 |
 | **先上采样再 FiLM** | 避免特征维度错位导致的伪影 |
 | **Add 融合而非 Concat** | 通道数不翻倍，显存减半 |
 | **渐进式 Mask（非切换）** | 网络从 Day1 就在学"补全"，避免 Catastrophic Forgetting |
@@ -179,8 +177,9 @@ sg[·] = stop_gradient（阻止梯度回传）
 | 参数 | 值 | 说明 |
 |------|-----|------|
 | `stage1_epochs` | 100 | 阶段一（码本预训练）持续 epoch 数 |
-| `train_views` / `max_views` | 6 / 48 | 最少/最多保留视角数 |
-| `target_keep` | 0.012 | 最终保留比例 (~6/491) |
+| `stage1_views` | 64 | 阶段一每 batch 最多视角数（随机采样，多 epoch 覆盖全视角） |
+| `train_views` / `max_views` | 6 / 48 | 阶段二视角范围 |
+| `target_keep` | 0.012 | 阶段二最终保留比例 (~6/491) |
 | `n_decoder_ups` | 1→256³, 2→512³ | 解码器上采样次数 |
 | `w_lap` / `w_struct` / `w_vq` | 1.0 / 0.3 / 0.1 | 损失权重 |
 | LR | 1e-4 | AdamW + CosineAnnealing |
@@ -198,10 +197,10 @@ LightningRecon/
 │   │                    Codebook(HF+MF), FiLMBlock3D, ProgressiveDecoder,
 │   │                    SparseViewReconstruction (6.3M params)
 │   ├── losses.py      # laplacian_pyramid_loss, structural_loss, ReconstructionLoss
-│   ├── dataset.py     # PairedCBCTDataset
+│   ├── dataset.py     # ThoraxCTDataset (pickle投影+CT体素)
 │   ├── train.py       # 三阶段训练 + 渐进Mask + AMP + checkpoint
 │   └── inference.py   # 端到端推理
-├── data/thorax_fast/       # → DeepSparse/data/thorax_fast
+├── ~/autodl-tmp/thorax/   # 数据源 (projections/*.pickle + images/ct/*.nii.gz)
 ├── logs/              # 训练日志 + TensorBoard + checkpoint
 └── mymodel.md         # 本文档
 ```
@@ -209,19 +208,85 @@ LightningRecon/
 ### 命令
 
 ```bash
-# 训练 (256³ 输出, 8GB 显卡)
-python src/train.py --data_root data/thorax_fast --epochs 400 \
-    --vol_size 256 256 256 --stage1_epochs 100 --n_decoder_ups 1 --max_views 24
+# ═══════════════════════════════════════════════════════════════════════
+# 完整训练 (阶段一 + 阶段二，一条命令跑到底)
+#
+#   阶段一 (epoch 1~100): 全视角 (~490张) 预训练码本 + 编码器 + 解码器
+#     每 batch 随机采样 --stage1_views 张，靠多 epoch 覆盖全部视角
+#   阶段二 (epoch 101~400): 冻结码本，视角渐进 24→6，微调解码器
+#
+#   参数分工:
+#     --stage1_epochs 100    ← 阶段一持续 epoch 数
+#     --stage1_views 64      ← 阶段一每 batch 视角数 (数据集只加载这么多, 随机采样, 省内存)
+#     --max_views 24         ← 阶段二视角递减起点 (从已加载的 stage1_views 中再子采样)
+#     --n_decoder_ups 1      ← 模型输出分辨率 (1=256³, 2=512³)
+# ═══════════════════════════════════════════════════════════════════════
+# 输出 256³, 推荐 RTX 4090 24GB / A5000
+python src/train.py --data_root ~/autodl-tmp/thorax --epochs 400 \
+    --vol_size 128 128 128 --stage1_epochs 100 --stage1_views 64 \
+    --n_decoder_ups 1 --max_views 24 --batch_size 1 --num_workers 2
 
-# 训练 (512³ 输出, ≥16GB 显卡)
-python src/train.py --data_root data/thorax_fast --epochs 400 \
-    --stage1_epochs 100 --n_decoder_ups 2 --max_views 48
+# 输出 512³, 需 ≥24GB 显存，如 A6000 / H100
+python src/train.py --data_root ~/autodl-tmp/thorax --epochs 400 \
+    --vol_size 128 128 128 --stage1_epochs 100 --stage1_views 64 \
+    --n_decoder_ups 2 --max_views 48 --batch_size 1 --num_workers 2
+
+# 仅跑阶段一 (epochs == stage1_epochs，验证码本是否正常收敛)
+python src/train.py --data_root ~/autodl-tmp/thorax --epochs 10 \
+    --vol_size 128 128 128 --stage1_epochs 10 --stage1_views 64 \
+    --n_decoder_ups 1 --max_views 24 --batch_size 1 --num_workers 2
 
 # 推理
 python src/inference.py \
-    --checkpoint logs/thorax_6view/best_model.pth \
-    --data_root data/thorax_fast --case_id CASE_ID --n_views 6
+    --checkpoint logs/thorax_6view_256/best_model.pth \
+    --data_root ~/autodl-tmp/thorax --case_id CASE_ID --n_views 6
 
 # TensorBoard
 tensorboard --logdir logs/
 ```
+
+### 已修复的已知问题（2026-07-21）
+
+> **1. CUDA index out of bounds（训练首步崩溃）**
+>
+> **根因**: 训练循环原先假定所有样本都有 491 张投影，但真实数据集中部分病例只有 316~490 张。
+> `torch.index_select` 传入超出实际视图数的索引时触发 CUDA device-side assert。
+>
+> **修复**: 在 `src/train.py` 中新增 `subsample_projections()` 函数，改为从当前张量的实际维度
+> (`projs.shape[1]`) 读取视图数再采样，不再依赖硬编码的 491。
+>
+> **2. 码本坍缩 — PSNR 停滞在 13dB 且 VQ loss 归零**
+>
+> **根因**: 阶段一（码本预训练）本应使用全部投影，但 `max_views` 参数被错误地同时作用到
+> 了阶段一，导致阶段一只用到了 24 张投影而非全部 491 张。码本因信息不足坍缩为 trivial solution。
+>
+> **修复**: 阶段一的 `n_keep` 改为 `V_total`（数据集实际最大投影数），不再被 `max_views` 截断。
+>
+> **3. 硬编码 V_total=491 — 无法适配不同投影数的数据集**
+>
+> **根因**: 训练脚本和数据集构造函数中硬编码了 `n_views=491` 和 `V_total=491`，
+> 无法适配投影数不统一或非 491 张的数据集。
+>
+> **修复**:
+> - `dataset.py`: `n_views` 默认值改为 `-1`（按需加载全部可用投影），同时预扫描所有病例的投影数范围
+> - `train.py`: `V_total` 从 `ts.max_views` / `vs.max_views` 动态读取，不再写死 491
+
+### 调试参数
+
+如果训练首步仍报 CUDA 错误，可以加入以下调试标志定位问题：
+
+```bash
+CUDA_LAUNCH_BLOCKING=1 PYTHONFAULTHANDLER=1 \
+python src/train.py --data_root ~/autodl-tmp/thorax --epochs 1 \
+    --vol_size 128 128 128 --stage1_epochs 1 --n_decoder_ups 1 \
+    --max_views 24 --batch_size 1 --num_workers 0 --eval_every 999
+```
+
+| 调试参数 | 作用 |
+|----------|------|
+| `CUDA_LAUNCH_BLOCKING=1` | 将异步 CUDA 调用变为同步，使错误栈精确指向出错的 Python 行 |
+| `PYTHONFAULTHANDLER=1` | 捕获 Segmentation Fault 等底层崩溃并打印 Python 调用栈 |
+| `--num_workers 0` | 禁用 DataLoader 多进程，排除 IPC 干扰 |
+| `--epochs 1 --stage1_epochs 1` | 单 epoch 快速验证，跳过完整训练 |
+| `--eval_every 999` | 跳过验证集评估，加速调试循环 |```
+

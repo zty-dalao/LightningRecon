@@ -1,10 +1,10 @@
 """
 损失函数: 拉普拉斯金字塔频域损失 + VQ 损失。
 
-L = λ₁·L_lap(Pred, pCT) + λ₂·L_struct(Pred, CBCT) + λ_vq·L_vq
+L = λ₁·L_lap(Pred, CT) + λ₂·L_struct(Pred, CT) + λ_vq·L_vq
 
 L_lap: 拉普拉斯金字塔分解，HF比HF, MF比MF, 形成闭环频域监督
-L_struct: 梯度 L1 (边缘结构对齐 CBCT)
+L_struct: 梯度 L1 (边缘结构对齐 CT)
 L_vq: 码本学习
 """
 
@@ -54,17 +54,17 @@ def laplacian_pyramid_loss(pred, gt, levels=2):
 
 
 # =========================================================================
-# 结构损失 (梯度 L1, 对齐 CBCT)
+# 结构损失 (梯度 L1, 对齐 CT)
 # =========================================================================
 
-def structural_loss(pred, cbct):
-    """三方向梯度 L1 差"""
+def structural_loss(pred, ref):
+    """三方向梯度 L1 差 (pred vs reference)"""
     def _grad(x):
         dx = torch.abs(x[:, :, 1:, :, :] - x[:, :, :-1, :, :])
         dy = torch.abs(x[:, :, :, 1:, :] - x[:, :, :, :-1, :])
         dz = torch.abs(x[:, :, :, :, 1:] - x[:, :, :, :, :-1])
         return dx.mean() + dy.mean() + dz.mean()
-    return torch.abs(_grad(pred) - _grad(cbct))
+    return torch.abs(_grad(pred) - _grad(ref))
 
 
 # =========================================================================
@@ -99,18 +99,17 @@ class ReconstructionLoss(nn.Module):
         self.w_vq = w_vq
         self.lap_levels = lap_levels
 
-    def forward(self, pred, cbct, pct, vq_loss):
+    def forward(self, pred, ct, vq_loss):
         """
-        pred: (B, 1, 256, 256, 256)
-        cbct: (B, 1, 256, 256, 256)  — 结构监督
-        pct:  (B, 1, 256, 256, 256)  — 频域+灰度监督
+        pred: (B, 1, D, H, W)
+        ct:   (B, 1, D, H, W)  — 频域监督 + 结构监督
         """
-        L_lap = laplacian_pyramid_loss(pred, pct, self.lap_levels)
-        L_struct = structural_loss(pred, cbct)
+        L_lap = laplacian_pyramid_loss(pred, ct, self.lap_levels)
+        L_struct = structural_loss(pred, ct)
         L_total = self.w_lap * L_lap + self.w_struct * L_struct + self.w_vq * vq_loss
 
         with torch.no_grad():
-            ssim_val = ssim_3d(pred, pct)
+            ssim_val = ssim_3d(pred, ct)
 
         return {
             'total': L_total, 'lap': L_lap, 'struct': L_struct,
