@@ -8,6 +8,7 @@
 """
 
 import os, sys, argparse, json
+import numpy as np
 import torch, torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -66,7 +67,7 @@ def evaluate(model, loader, device, criterion):
         if mask is not None:
             mask_a = nn.functional.interpolate(mask, size=pred.shape[2:], mode='nearest')
             psnr_m = _psnr(pred, ct_a, mask_a)
-            if not np.isnan(psnr_m):
+            if not np.isnan(float(psnr_m)):
                 m['psnr_mask'] += psnr_m * B
                 m['c_mask'] += B
         for k in ['ssim','lap','struct','total']: m[k]+=loss[k].item()*B

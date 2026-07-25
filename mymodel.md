@@ -169,6 +169,60 @@ sg[·] = stop_gradient（阻止梯度回传）
 | **Add 融合而非 Concat** | 通道数不翻倍，显存减半 |
 | **渐进式 Mask（非切换）** | 网络从 Day1 就在学"补全"，避免 Catastrophic Forgetting |
 | **3D 全局池化 → FiLM 条件** | 用整体风格向量调制局部特征，比逐像素调制更鲁棒 |
+| **EMA 码本（非梯度码本）** | 梯度码本易坍缩 (SSIM≈0)；EMA 指数移动平均更新码字，避免死神经元 |
+| **分块距离计算** | 128³ 体积 × 512 码字 = 4GB 矩阵 → 自动分块 (≤256MB/块)，避免 OOM |
+
+---
+
+## 码本实现：EMA Vector Quantizer
+
+### 为什么不用梯度码本？
+
+原始梯度码本 (`query_codebook_3d`) 使用直通估计器 (STE) 回传梯度：
+- **问题**：梯度码本无法保证码字被充分使用 → **码本坍缩**（SSIM≈0，perplexity≈1）
+- **表现**：训练 60+ 轮 SSIM 始终为 0，所有编码器输出映射到 1-2 个码字
+
+### EMA 码本原理
+
+```python
+# 核心：EMA 更新替代梯度更新
+class EmbeddingEMA:
+    cluster_size_ema = decay * cluster_size + (1-decay) * sum(one_hot)
+    embed_avg_ema    = decay * embed_avg    + (1-decay) * embed_sum
+    
+    # 拉普拉斯平滑避免除零
+    weight = embed_avg_normalized / (cluster_size_smoothed)
+    
+    # 关键：未使用的码字保持原值（不除以 eps）
+    weight[cluster_size == 0] = weight_original
+```
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| `decay` | 0.99 | EMA 衰减速率为 0.99，稳定更新 |
+| `beta` | 0.25 | commitment loss 权重 |
+| `eps` | 1e-5 | 拉普拉斯平滑系数 |
+| 距离精度 | fp32 | 强制 float32 计算距离，防止 AMP fp16 溢出 NaN |
+
+### 分块计算：避免 O(N×K) 矩阵 OOM
+
+```
+问题：einsum('bd,nd->bn', z, w) 产生的距离矩阵：
+  HF 码本：64³ × 1024 = 262K × 1024 = 1.0 GB
+  MF 码本：128³ × 512  = 2.1M × 512  = 4.3 GB  ← OOM!
+
+解决：自适应分块
+  chunk_size = 256MB / (num_tokens × 4)
+  → 将 z 分成多个 chunk，逐块计算 argmin 和 scatter_add
+  → 数学等价，峰值内存从 4.3GB 降到 256MB
+```
+
+双码本配置：
+
+| 码本 | 体积 | 通道 | 码字数 | 分块数 | 峰值显存 | 用途 |
+|------|------|------|--------|--------|----------|------|
+| HF | 64³ | 128 | 1024 | ~4 | 256 MB | 高频细节纹理 |
+| MF | 128³ | 64 | 512 | ~32 | 128 MB | 中频器官轮廓 |
 
 ---
 
@@ -177,14 +231,65 @@ sg[·] = stop_gradient（阻止梯度回传）
 | 参数 | 值 | 说明 |
 |------|-----|------|
 | `stage1_epochs` | 100 | 阶段一（码本预训练）持续 epoch 数 |
-| `stage1_views` | 64 | 阶段一每 batch 最多视角数（随机采样，多 epoch 覆盖全视角） |
-| `train_views` / `max_views` | 6 / 48 | 阶段二视角范围 |
+| `stage1_views` | 64 | 阶段一每 batch 视角数（随机采样，多 epoch 覆盖全视角） |
+| `train_views` / `max_views` | 6 / 24 | 阶段二视角范围 |
 | `target_keep` | 0.012 | 阶段二最终保留比例 (~6/491) |
-| `n_decoder_ups` | 1→256³, 2→512³ | 解码器上采样次数 |
+| `n_decoder_ups` | 1→256³, 可选 2→512³ | 解码器上采样次数（默认 1 以减少显存） |
 | `w_lap` / `w_struct` / `w_vq` | 1.0 / 0.3 / 0.1 | 损失权重 |
 | LR | 1e-4 | AdamW + CosineAnnealing |
 | Batch Size | 1 | 3D 模型显存限制 |
-| AMP | True | fp16 混合精度 |
+| `grad_accum` | 4 | 梯度累积步数（等效 batch_size=4） |
+| AMP | True | fp16 混合精度（autocast + GradScaler） |
+| `vol_size` | 128 128 128 | 输出体素尺寸 |
+| `proj_size` | 128 128 | 投影图 resize 尺寸 |
+
+### 实际训练命令
+
+```bash
+# 环境
+conda activate deepsparse
+cd /root/autodl-tmp/LightningRecon
+
+# 硬件：RTX 4090D 24GB, 16核 CPU, 80GB RAM
+# 数据：/root/autodl-tmp/thorax/ (116 train + 26 test)
+
+# 完整 400 轮训练（阶段一 100 轮，阶段二 300 轮）
+python src/train.py \
+    --data_root /root/autodl-tmp/thorax \
+    --epochs 400 \
+    --vol_size 128 128 128 \
+    --proj_size 128 128 \
+    --stage1_epochs 100 \
+    --stage1_views 64 \
+    --grad_accum 4 \
+    --n_decoder_ups 1 \
+    --max_views 24 \
+    --batch_size 1 \
+    --num_workers 2
+
+# 快速测试（2 轮）
+python src/train.py \
+    --data_root /root/autodl-tmp/thorax \
+    --epochs 2 \
+    --vol_size 128 128 128 \
+    --proj_size 128 128 \
+    --stage1_epochs 100 \
+    --stage1_views 32 \
+    --grad_accum 2 \
+    --n_decoder_ups 1 \
+    --max_views 24 \
+    --batch_size 1 \
+    --num_workers 0
+```
+
+### 基线对比
+
+| 方法 | PSNR (dB) | SSIM | 说明 |
+|------|-----------|------|------|
+| CBCT vs CT | 17.69 ± 3.01 | 0.765 ± 0.214 | 训练集 (116 例) |
+| CBCT vs CT | 17.93 ± 2.35 | 0.808 ± 0.137 | 测试集 (26 例) |
+| 模型 (2 轮快速测试) | 20.76 | 0.473 | 仅 2 轮，SSIM 在快速增长中 |
+| 模型 (5 轮) | - | - | 损失: 0.115→0.040, 码本损失: 0.017→0.004 |
 
 ---
 
@@ -193,11 +298,31 @@ sg[·] = stop_gradient（阻止梯度回传）
 ```
 LightningRecon/
 ├── src/
-│   ├── models.py      # MultiScaleCNN2D, ViewTransformer, BackProjection3D,
-│   │                    Codebook(HF+MF), FiLMBlock3D, ProgressiveDecoder,
-│   │                    SparseViewReconstruction (6.3M params)
-│   ├── losses.py      # laplacian_pyramid_loss, structural_loss, ReconstructionLoss
-│   ├── dataset.py     # ThoraxCTDataset (pickle投影+CT体素)
+│   ├── models.py        # MultiScaleCNN2D (动态尺寸), ViewTransformer,
+│   │                      BackProjection3D, EMAVectorQuantizer3D (HF+MF),
+│   │                      FiLMBlock3D, ProgressiveDecoder,
+│   │                      SparseViewReconstruction (6.5M params)
+│   ├── ema_codebook.py  # EMA 码本实现 (分块距离计算, scatter_add EMA 统计)
+│   │                      - EmbeddingEMA: EMA 更新的 embedding
+│   │                      - EMAVectorQuantizer: 单层 VQ (分块 argmin)
+│   │                      - EMAVectorQuantizer3D: 3D 封装 (pre/post 1×1×1 conv)
+│   ├── losses.py        # laplacian_pyramid_loss, structural_loss, ReconstructionLoss
+│   ├── dataset.py       # ThoraxCTDataset (pickle投影+CT体素+mask)
+│   ├── train.py         # 三阶段训练脚本 (grad_accum, masked PSNR, AMP)
+│   └── inference.py     # 推理脚本
+├── tests/
+│   ├── test_dataset.py  # 数据集加载测试
+│   └── baseline_psnr.py # CBCT vs CT 基线 PSNR/SSIM 计算
+├── logs/                # 训练日志 + TensorBoard
+│   └── thorax_fast_6view_256/
+│       ├── best_model.pth
+│       ├── config.json
+│       └── tensorboard/
+├── data/thorax_fast/    # 原始数据（投影 npy + 预处理脚本）
+├── mymodel.md           # 本文档
+├── mythinking.md        # 设计思路笔记
+└── requirements.txt
+```
 │   ├── train.py       # 三阶段训练 + 渐进Mask + AMP + checkpoint
 │   └── inference.py   # 端到端推理
 ├── ~/autodl-tmp/thorax/   # 数据源 (projections/*.pickle + images/ct/*.nii.gz)

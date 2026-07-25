@@ -16,6 +16,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .ema_codebook import EMAVectorQuantizer3D
+
 
 # =========================================================================
 # 基础模块
@@ -144,44 +146,6 @@ class BackProjection3D(nn.Module):
         return self.conv(x)                                         # (B, out_ch, D, D, D)
 
 
-# =========================================================================
-# 码本
-# =========================================================================
-
-class Codebook(nn.Module):
-    """M×dim, argmin L2 (强制 fp32 计算，防止 AMP fp16 溢出)"""
-    def __init__(self, N, D):
-        super().__init__()
-        self.N, self.D = N, D
-        self.cb = nn.Embedding(N, D)
-        nn.init.xavier_uniform_(self.cb.weight)
-
-    def forward(self, q):
-        Nq, D = q.shape
-        # 强制 fp32 计算距离，AMP 下 fp16 的 128-dim 点积会数值溢出
-        q_f = q.float()
-        cb_f = self.cb.weight.float()
-        qn2 = torch.sum(q_f ** 2, dim=1, keepdim=True)
-        cn2 = torch.sum(cb_f ** 2, dim=1)
-        CH, idx = 65536, torch.empty(Nq, dtype=torch.long, device=q.device)
-        for s in range(0, Nq, CH):
-            e = min(s+CH, Nq)
-            dot = torch.matmul(q_f[s:e], cb_f.t())
-            idx[s:e] = (qn2[s:e] + cn2.unsqueeze(0) - 2*dot).argmin(dim=-1)
-        fc = self.cb(idx).to(q.dtype)                               # 回到原精度
-        enc = F.one_hot(idx, self.N).float(); avg = enc.mean(dim=0)
-        perp = torch.exp(-torch.sum(avg*torch.log(avg+1e-10)))
-        return fc, q - fc.detach(), idx, perp
-
-
-def query_codebook_3d(feat, cb):
-    """feat(B,C,D,H,W) → (B,cb.D,D,H,W), vq_loss, perp"""
-    B, C, D, H, W = feat.shape
-    q = feat.permute(0,2,3,4,1).reshape(B*D*H*W, C)
-    fc, delta, idx, perp = cb(q)
-    vq = F.mse_loss(fc.detach(), q) + 0.25*F.mse_loss(q, fc.detach())
-    return fc.reshape(B,D,H,W,cb.D).permute(0,4,1,2,3), vq, perp
-
 
 # =========================================================================
 # FiLM 调制块 (条件来自 3D 全局池化)
@@ -258,9 +222,9 @@ class SparseViewReconstruction(nn.Module):
         # ---- 2. 单反投影 → 64³ ----
         self.backproj = BackProjection3D(in_ch=256, mid_ch=128, out_ch=64, vol_depth=64)
 
-        # ---- 3. 双码本 ----
-        self.codebook_hf = Codebook(N=1024, D=128)                  # HF: 128-dim
-        self.codebook_mf = Codebook(N=512, D=64)                    # MF: 64-dim
+        # ---- 3. 双码本 (EMA 更新, 防止坍塌) ----
+        self.codebook_hf = EMAVectorQuantizer3D(n_embed=1024, embedding_dim=128, beta=0.25)
+        self.codebook_mf = EMAVectorQuantizer3D(n_embed=512,  embedding_dim=64,  beta=0.25)
 
         # 通道投影 (vol 64ch → codebook dim)
         self.proj_hf = nn.Conv3d(64, 128, 1)                        # 64→128 for HF query
@@ -296,11 +260,11 @@ class SparseViewReconstruction(nn.Module):
 
         # ---- 3. 双码本查询 ----
         q_hf = self.proj_hf(vol)                                    # (B, 128, 64³)
-        A_hf, vq_hf, perp_hf = query_codebook_3d(q_hf, self.codebook_hf)
+        A_hf, vq_hf, perp_hf = self.codebook_hf(q_hf)
         # MF: 上采样到 128³ 再查码本
         vol_mf = self.mf_up(vol)                                    # (B, 64, 128³)
         q_mf = self.proj_mf(vol_mf)                                 # (B, 64, 128³)
-        B_mf, vq_mf, perp_mf = query_codebook_3d(q_mf, self.codebook_mf)
+        B_mf, vq_mf, perp_mf = self.codebook_mf(q_mf)
 
         vq_loss = vq_hf + vq_mf
         perplexity = (perp_hf + perp_mf) / 2.0
@@ -311,10 +275,10 @@ class SparseViewReconstruction(nn.Module):
         return out, vq_loss, perplexity
 
     def freeze_codebooks(self):
-        """阶段2: 冻结双码本"""
-        for p in self.codebook_hf.parameters(): p.requires_grad = False
-        for p in self.codebook_mf.parameters(): p.requires_grad = False
-        print('[Stage 2] Codebooks frozen.')
+        """阶段2: 冻结双码本 (停止 EMA 更新)"""
+        self.codebook_hf.freeze()
+        self.codebook_mf.freeze()
+        print('[Stage 2] Codebooks frozen (EMA updates disabled).')
 
     def freeze_encoder(self):
         """阶段3: 冻结编码器+码本, 仅保留decoder可训(可选)"""
