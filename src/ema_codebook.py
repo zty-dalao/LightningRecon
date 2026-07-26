@@ -114,12 +114,32 @@ class EMAVectorQuantizer(nn.Module):
         # perplexity (fp32, scatter 已累加完成)
         avg_probs = enc_sum / enc_sum.sum().clamp(min=1)
         perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs.clamp(min=1e-10))))
+        active_codes = (enc_sum > 0).sum()
+        batch_diagnostics = {
+            'perplexity': perplexity.detach(),
+            'batch_active_codes': active_codes.detach(),
+            'batch_active_fraction': (
+                active_codes.float() / float(self.num_tokens)
+            ).detach(),
+            'batch_dead_codes': (self.num_tokens - active_codes).detach(),
+        }
 
         # EMA 更新码本 (训练时, scatter 已累加完成)
         if do_ema:
             self.embedding.cluster_size_ema_update(enc_sum)
             self.embedding.embed_avg_ema_update(embed_sum)
             self.embedding.weight_update(self.num_tokens)
+        ema_active_codes = (self.embedding.cluster_size > self.embedding.eps).sum()
+        batch_diagnostics.update({
+            'ema_active_codes': ema_active_codes.detach(),
+            'ema_active_fraction': (
+                ema_active_codes.float() / float(self.num_tokens)
+            ).detach(),
+            'ema_dead_codes': (
+                self.num_tokens - ema_active_codes
+            ).detach(),
+        })
+        self._last_diagnostics = batch_diagnostics
 
         # commitment loss (fp32 计算后转回原精度)
         loss = self.beta * F.mse_loss(z_q.detach().float(), z_f)
@@ -134,6 +154,10 @@ class EMAVectorQuantizer(nn.Module):
 
     def unfreeze(self):
         self.embedding._update = True
+
+    def diagnostics(self):
+        """Return diagnostics from the most recent forward pass."""
+        return getattr(self, '_last_diagnostics', {})
 
 
 # =========================================================================
@@ -183,3 +207,12 @@ class EMAVectorQuantizer3D(nn.Module):
     def unfreeze(self):
         self.codebook.unfreeze()
         print('[EMA Codebook] Unfrozen.')
+
+    def set_adapter_trainable(self, trainable):
+        """Toggle gradient training for pre/post quantization convolutions only."""
+        for module in (self.pre_quant, self.post_quant):
+            for parameter in module.parameters():
+                parameter.requires_grad = trainable
+
+    def diagnostics(self):
+        return self.codebook.diagnostics()

@@ -17,9 +17,9 @@ graph TD
     classDef data fill:#fff9c4,stroke:#f57f17,stroke-width:2px;
     classDef frozen fill:#ffcdd2,stroke:#c62828,stroke-width:2px,stroke-dasharray: 5 5;
 
-    subgraph Stage1 [阶段一：码本预训练（全视角）]
+    subgraph Stage1 [阶段一：码本预训练（原始491中直采60/64 views）]
         direction TB
-        P1["全视角 491 张投影 + 角度编码"]:::data --> P2["2D CNN + Transformer"]:::module
+        P1["固定等间隔 60/64 张投影 + 真实角度编码"]:::data --> P2["2D CNN + 4层跨视角 Transformer"]:::module
         P2 --> P3["2D→3D 可微分反投影"]:::module
         P3 --> P4["3D 特征体素 (64³×256ch)"]:::data
         P4 --> P5["HF 保留 64³ / MF 上采样至 128³"]:::module
@@ -32,7 +32,7 @@ graph TD
 
     subgraph Stage2 [阶段二：主网络微调（稀疏视角，码本冻结）]
         direction TB
-        F1["混合输入：全视角→稀疏视角<br>(6~10 张) + 角度编码"]:::data --> F2["固定权重 2D CNN<br>(与阶段一共享)"]:::module
+        F1["目标锚定的内置视角课程<br>+ 真实角度编码"]:::data --> F2["共享权重 2D CNN<br>+ 4层跨视角 Transformer"]:::module
         F2 --> F3["2D→3D 反投影"]:::module
         F3 --> F4["3D 特征体素 (64³×256ch)"]:::data
         F4 --> F5["HF 64³ / MF 上采样 128³"]:::module
@@ -59,46 +59,59 @@ graph TD
 
         F17 --> F18["渐进式上采样"]:::module
         F18 --> F19["256³×32ch"]:::data
-        F19 --> F20["→ 512³×1ch"]:::module
+        F19 --> F20["→ 配置的目标分辨率×1ch"]:::module
         F20 --> F21["最终体素输出"]:::data
     end
 
-    subgraph Stage3 [阶段三：极速推理（纯稀疏投影）]
+    subgraph Stage3 [阶段三：固定目标协议微调]
         direction TB
-        I1["稀疏视角 6~10 张 + 角度编码"]:::data --> I2["轻量级 2D CNN (固定)"]:::module
+        I1["固定 final_view + 真实角度编码"]:::data --> I2["2D CNN + 4层跨视角 Transformer（可训练）"]:::module
         I2 --> I3["反投影 → 64³ 体素"]:::module
-        I3 --> I4["查询冻结码本 H + M"]:::module
+        I3 --> I4["查询冻结 EMA 码字及量化适配层"]:::module
         P7 -.-> I4
         P8 -.-> I4
         I4 --> I5["A(64³)↑ + FiLM + Add(B)"]:::module
-        I5 --> I6["渐进上采样 → 512³"]:::module
-        I6 --> I7["512³×1ch CT 体素"]:::data
+        I5 --> I6["渐进上采样 → 配置的目标分辨率"]:::module
+        I6 --> I7["目标协议微调输出"]:::data
     end
 ```
 
-### 三阶段总览 (v4)
+### Transformer 配置
+
+模型只实例化一个共享的 `ViewTransformer`，在三个训练阶段复用同一组参数。
+该模块内部堆叠 **4 个 `TransformerEncoderLayer`**，每层使用 4 个注意力头，
+特征维度为 256，前馈层维度为 1024。注意力沿视角维度计算；进入
+Transformer 前，二维特征会自适应池化到 `8×8`，输出恢复空间尺寸后与
+CNN 特征做残差相加。
+
+### 三阶段总览
 
 | 阶段 | Epoch | 视角 | 码本 | LR | 说明 |
 |------|-------|------|------|-----|------|
-| 阶段一 | 1~200 | 64 | 🔓 可学习 (1e-4) | encoder=1e-4 | 构建解剖码本 |
-| 阶段二 | 201~600 | 56→...→8 (10级) | 🔓 低LR (5e-6) | encoder=5e-5 | 平滑适应稀疏视角 |
-| 阶段三 | 601~700 | 6 | 🔒 冻结 (LR=0) | encoder=1e-5, decoder=2e-5 | 终态 6-view 微调 |
+| 阶段一 | 前200轮 | 60或64 | 🔓 EMA 更新 | encoder=1e-4 | 构建解剖码本 |
+| 阶段二 | 每级40轮 | 内置课程逐级降至`final_view` | 🔒 EMA 码字冻结 | encoder=5e-5 | 保留最终厂家角度的稀疏适应 |
+| 阶段三 | 最后100轮 | `final_view` | 🔒 EMA及量化适配层冻结 | encoder=1e-5, decoder=2e-5 | 目标稀疏协议微调 |
 
-**视角衰减**：`--stage2_view_decay "8,4,2"` 自动生成 11 级平滑序列：
+**视角课程**：由 `--final_view` 选择内置确定性映射：
 
-| 步长 | 阶段 | 序列 | 每级 epoch |
-|------|------|------|-----------|
-| 8 | 前期快降 | 64→56→48→40→32→24 | 40 |
-| 4 | 中期细调 | 24→20→16→12 | 40 |
-| 2 | 后期逼近 | 12→10→8→6 | 40 |
+| `final_view` | 阶段一及阶段二课程（高→低） | 阶段三 |
+|---|---|---|
+| 6 | 60→54→48→36→24→12→6 | 固定6 |
+| 8 | 64→56→48→32→24→16→8 | 固定8 |
+| 10 | 60→50→40→30→20→10 | 固定10 |
 
-总计：**200 + 10×40 + 100 = 700 epochs**
+默认总计：6/8-view为 **540 epochs**，10-view为 **500 epochs**。
 
-也可用其他步长组合：`"6,3"` / `"4,2"` / `"8"`，算法自动推断各步长的适用范围。
+可用 `--view_schedule` 提供完整高到低序列覆盖内置映射；覆盖序列仍须保持最终视角角度锚定。
+
+每一级视角都直接按照 `floor(k×491/n_views)` 从原始 491-view
+全旋转网格选择，不经过 60/64-view 二次下采样。训练集用于更新参数，
+验证集用于选择 best checkpoint，测试集只在训练结束后对 best checkpoint
+评估一次。
 
 ----
 
-## 损失函数 (v4: Charbonnier 主导)
+## 损失函数（Charbonnier 主导）
 
 损失函数从三部分改为四部分，**L_img (Charbonnier) 为主损失**：
 
@@ -108,9 +121,9 @@ L_total = w_img·L_img + w_lap·L_lap + w_struct·L_struct + w_vq·L_vq
 
 | 阶段 | w_img | w_lap | w_struct | w_vq | 说明 |
 |------|-------|-------|----------|------|------|
-| 阶段一 (64 views) | **1.0** | 0.05 | 0.10 | 0.05 | 码本学习，L_img 主导 |
-| 阶段二 (56→8 views) | **1.0** | 0.04 | 0.08 | 0.02 | 稀疏适应，码本低LR |
-| 阶段三 (6 views) | **1.0** | 0.02 | 0.05 | 0 | 纯微调，码本冻结 |
+| 阶段一 (60/64 views) | **1.0** | 0.05 | 0.05 | 0.05 | EMA码字学习，L_img 主导 |
+| 阶段二 (内置课程→目标) | **1.0** | 0.04 | 0.08 | 0.02 | EMA码字冻结，稀疏适应 |
+| 阶段三 (目标视角) | **1.0** | 0.02 | 0.05 | 0 | 量化模块冻结，编码器/解码器微调 |
 
 ### 1. L_img — Charbonnier 图像损失（权重 1.0，**主导**）
 
@@ -124,11 +137,22 @@ L_total = w_img·L_img + w_lap·L_lap + w_struct·L_struct + w_vq·L_vq
 
 金字塔分解后逐级 L1 对齐，形成闭环频域监督。
 
-### 3. L_struct — 结构损失（权重 0.05~0.10，辅助）
+### 3. L_struct — 结构损失（权重 0.05~0.08，辅助）
 
-三方向梯度 L1 差，对齐解剖边缘。
+逐体素比较三个方向的一阶梯度 L1，对齐解剖边缘的位置和幅度。阶段一
+使用 0.05，阶段二稀疏适应提高到 0.08；若启用阶段三，最终微调回落到
+0.05，避免过度锐化稀疏视角条纹。若 `--stage3_epochs 0`，两阶段训练的
+最终阶段保持 0.08。
 
 ### 4. L_vq — 码本损失（权重 0~0.05，正则）
+
+验证指标逐病例调用 `skimage.metrics.structural_similarity` 计算完整
+3D 体数据 SSIM，不拆分 2D axial slice；使用 Gaussian 权重、
+`sigma=1.5`、`win_size=11`、`data_range=1.0`、
+`use_sample_covariance=False`、`channel_axis=None`（即 `11×11×11`
+三维窗口），然后对病例平均。TensorBoard 还分别记录 HF/MF 码本的 perplexity、
+batch/EMA active fraction、active codes 和 dead codes，以及各加权损失
+对总损失的贡献比例。
 
 ---
 
@@ -136,7 +160,7 @@ L_total = w_img·L_img + w_lap·L_lap + w_struct·L_struct + w_vq·L_vq
 
 | 决策 | 原因 |
 |------|------|
-| **阶段一冻结码本** | 码本存储通用解剖先验，后续不应被稀疏视角的残缺特征污染 |
+| **阶段二开始冻结EMA码字** | 码本存储通用解剖先验，后续不应被稀疏视角的残缺特征污染 |
 | **HF 64³ / MF 128³** | HF 小尺寸存细节纹理，MF 大尺寸存器官轮廓骨架 |
 | **L_lap + L_struct 都用 CT** | 不再使用 CBCT，CT 同时提供精准 HU 和清晰边缘，双损失互补 |
 | **先上采样再 FiLM** | 避免特征维度错位导致的伪影 |
@@ -206,12 +230,14 @@ class EmbeddingEMA:
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--stage1_epochs` | 200 | 阶段一 64-view 预训练轮数 |
-| `--stage1_views` | 64 | 阶段一视角数 |
-| `--stage2_view_decay` | `"8,4,2"` | 阶段二视角衰减：步长模式（自动生成序列）或显式列表 |
+| `--stage1_epochs` | 200 | 阶段一最高视角预训练轮数 |
+| `--final_view` | 6 | 最终训练、验证和推理视角；可选6/8/10 |
+| `--view_schedule` | 空 | 可选完整覆盖序列，如`"60,48,36,24,12,6"` |
+| `--run_version` | 必填 | 唯一运行版本，如`v3`；已有非空版本目录不会被覆盖 |
+| `--source_views` | 491 | 原始360°投影网格数量；所有阶段从该网格直接采样 |
+| `--resume` | 空 | 从 best、periodic 或 last checkpoint 完整恢复 |
 | `--stage2_epochs_per_view` | 40 | 阶段二每个视角级训练轮数 |
-| `--stage3_epochs` | 100 | 阶段三 6-view 冻结码本微调轮数 |
-| `--train_views` | 6 | 最终推理视角数（阶段三 + `auto_decay_views` 终点） |
+| `--stage3_epochs` | 100 | 阶段三目标视角微调轮数 |
 
 ### 模型
 
@@ -219,6 +245,7 @@ class EmbeddingEMA:
 |------|--------|------|
 | `--vol_size` | 128 128 128 | 输出体素尺寸 |
 | `--proj_size` | 128 128 | 投影图 resize 尺寸 |
+| `--transformer_layers` | 4 | 跨视角 `TransformerEncoderLayer` 堆叠数；写入 checkpoint 并由推理读取 |
 | `--n_decoder_ups` | 1 | 解码器上采样次数 (1=256³, 2=512³; 2 需 >24GB) |
 
 ### 优化
@@ -228,31 +255,31 @@ class EmbeddingEMA:
 | `--batch_size` | 1 | 3D 模型显存限制 |
 | `--grad_accum` | 4 | 梯度累积（等效 batch=grad_accum，loss 已除以 accum） |
 | `--amp` | True | fp16 混合精度 |
-| `--lr` | 1e-4 | 基础学习率（阶段一 encoder；阶段内部自动分组 LR） |
+学习率由阶段策略自动设置，并分别记录 encoder、codebook 和 decoder。
 
 ### 损失权重（阶段内自动切换，无需手动设置）
 
 | 阶段 | `w_img` | `w_lap` | `w_struct` | `w_vq` |
 |------|---------|---------|------------|--------|
-| 阶段一 | 1.0 | 0.05 | 0.10 | 0.05 |
+| 阶段一 | 1.0 | 0.05 | 0.05 | 0.05 |
 | 阶段二 | 1.0 | 0.04 | 0.08 | 0.02 |
 | 阶段三 | 1.0 | 0.02 | 0.05 | 0 |
 
 ### 训练命令
 
 ```bash
-conda activate deepsparse
+conda activate lightningrecon
 cd /root/autodl-tmp/LightningRecon
 
 # ═══════════════════════════════════════════════════════════════
-# ① 完整训练 256³ (推荐, 4090D 24GB 可跑, 约 700 轮)
+# ① 完整训练 256³ (推荐, 6/8-view约540轮，10-view约500轮)
 # ═══════════════════════════════════════════════════════════════
 python src/train.py \
     --data_root /root/autodl-tmp/thorax \
     --vol_size 128 128 128 --proj_size 128 128 \
-    --stage1_epochs 200 --stage1_views 64 \
-    --stage2_view_decay "8,4,2" --stage2_epochs_per_view 40 \
-    --stage3_epochs 100 --train_views 6 \
+    --final_view 6 --run_version v3 \
+    --stage1_epochs 200 --stage2_epochs_per_view 40 \
+    --stage3_epochs 100 \
     --n_decoder_ups 1 --grad_accum 8 --batch_size 1 --num_workers 2
 
 # ═══════════════════════════════════════════════════════════════
@@ -261,42 +288,60 @@ python src/train.py \
 python src/train.py \
     --data_root /root/autodl-tmp/thorax \
     --vol_size 128 128 128 --proj_size 128 128 \
-    --stage1_epochs 200 --stage1_views 64 \
-    --stage2_view_decay "8,4,2" --stage2_epochs_per_view 40 \
-    --stage3_epochs 100 --train_views 6 \
+    --final_view 6 --run_version v3 \
+    --stage1_epochs 200 --stage2_epochs_per_view 40 \
+    --stage3_epochs 100 \
     --n_decoder_ups 2 --grad_accum 8 --batch_size 1 --num_workers 2
 
 # ═══════════════════════════════════════════════════════════════
-# ③ 仅阶段一 (快速验证码本收敛, 10 轮)
+# ③ 快速验证EMA学习及课程切换（6-view共16轮）
 # ═══════════════════════════════════════════════════════════════
 python src/train.py \
     --data_root /root/autodl-tmp/thorax \
     --vol_size 128 128 128 --proj_size 128 128 \
-    --stage1_epochs 10 --stage1_views 64 \
-    --stage2_view_decay "" --stage3_epochs 0 \
+    --final_view 6 --run_version v3 --stage1_epochs 10 \
+    --stage2_epochs_per_view 1 --stage3_epochs 0 \
     --n_decoder_ups 1 --grad_accum 2 --batch_size 1 --num_workers 0
 
 # ═══════════════════════════════════════════════════════════════
-# ④ 快速端到端测试 (3 轮, 每阶段 1 轮)
+# ④ 快速端到端测试（6-view共8轮）
 # ═══════════════════════════════════════════════════════════════
 python src/train.py \
     --data_root /root/autodl-tmp/thorax \
     --vol_size 128 128 128 --proj_size 128 128 \
-    --stage1_epochs 1 --stage1_views 64 \
-    --stage2_view_decay "8,4,2" --stage2_epochs_per_view 1 \
-    --stage3_epochs 0 \
+    --final_view 6 --run_version v3 --stage1_epochs 1 \
+    --stage2_epochs_per_view 1 \
+    --stage3_epochs 1 \
     --n_decoder_ups 1 --grad_accum 2 --batch_size 1 --num_workers 0
 
 # ═══════════════════════════════════════════════════════════════
 # ⑤ 推理
 # ═══════════════════════════════════════════════════════════════
 python src/inference.py \
-    --checkpoint logs/thorax_fast_6view_256/best_model.pth \
-    --data_root /root/autodl-tmp/thorax --case_id CASE_ID --n_views 6
+    --checkpoint 'logs/thorax_fast_finalview=6_256_v3/best_model_finalview=6_v3.pth' \
+    --data_root /root/autodl-tmp/thorax --case_id CASE_ID --final_view 6
 
 # TensorBoard
-tensorboard --logdir logs/
+tensorboard --logdir 'logs/thorax_fast_finalview=6_256_v3/tensorboard'
 ```
+
+训练程序会根据实际的 `--run_version` 构造运行目录，并在启动时打印本次
+运行专用的 TensorBoard 命令。例如传入 `--run_version v3` 时，日志目录
+为 `thorax_fast_finalview=6_256_v3/tensorboard`；传入 `v4` 时则自动变为
+对应的 `_v4/tensorboard`，不需要手工修改训练代码。
+
+当前版本只主动写入以下 TensorBoard 内容：
+
+- `Run/Metadata`
+- `Train/Loss/*` 与 `Train/LossContribution/*`
+- `Train/LearningRate/*`、`Train/n_views`、`Train/Stage`
+- `Codebook/*`
+- `Val/*` 与 `Test/*`
+
+不会调用 `add_graph()`，因此不会写入 Transformer 内部计算图。每个新运行
+必须使用新的 `--run_version`，非空运行目录会被拒绝；resume 会使用
+`purge_step` 处理恢复点之后的重叠 step。旧版目录中多次启动产生的多个
+event 文件仍会被 TensorBoard 合并展示，应与新版本运行目录分开查看。
 
 ### 基线对比
 
@@ -330,8 +375,9 @@ LightningRecon/
 │   ├── test_dataset.py  # 数据集加载测试
 │   └── baseline_psnr.py # CBCT vs CT 基线 PSNR/SSIM 计算
 ├── logs/                # 训练日志 + TensorBoard
-│   └── thorax_fast_6view_256/
-│       ├── best_model.pth
+│   └── thorax_fast_finalview=6_256_v3/
+│       ├── best_model_finalview=6_v3.pth
+│       ├── ckpt_0050_finalview=6_v3.pth
 │       ├── config.json
 │       └── tensorboard/
 ├── data/thorax_fast/    # 原始数据（投影 npy + 预处理脚本）

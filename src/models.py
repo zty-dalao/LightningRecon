@@ -1,17 +1,16 @@
 """
-SparseViewReconstruction v3: 单反投影 + HF(64³)/MF(128³)双码本 + Add融合。
+SparseViewReconstruction: 单反投影 + HF(64³)/MF(128³)双码本 + Add融合。
 
 三阶段架构:
-  阶段1 (预训练码本): 全视角 → 训练全部权重 (包括码本)
-  阶段2 (主网络微调): 渐进Mask → 冻结码本, 微调解码器+FiLM
-  阶段3 (推理):        稀疏投影 → 全冻结, 纯前向 → 512³
+  阶段1 (预训练码本): 从原始网格直接采样60/64 views → 训练全部权重和EMA码字
+  阶段2 (稀疏适应):    逐级降低视角，冻结EMA码字并训练量化适配层
+  阶段3 (目标微调):    固定final_view，冻结EMA码字和量化适配层
 
 数据维度:
   输入: (B, V, 3, 256, 256)
   输出: (B, 1, 512, 512, 512)
 """
 
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -99,7 +98,7 @@ class MultiScaleCNN2D(nn.Module):
 
 class ViewTransformer(nn.Module):
     """空间压缩到 8² 后做跨视角自注意力"""
-    def __init__(self, dim=256, num_heads=4, num_layers=2, pool_size=8):
+    def __init__(self, dim=256, num_heads=4, num_layers=4, pool_size=8):
         super().__init__()
         self.pool_size = pool_size
         layer = nn.TransformerEncoderLayer(d_model=dim, nhead=num_heads, dim_feedforward=dim*4,
@@ -165,7 +164,7 @@ class FiLMBlock3D(nn.Module):
 
 
 # =========================================================================
-# 渐进式解码器: HF↑→FiLM→Add(MF)→512³
+# 渐进式解码器: HF↑→FiLM→Add(MF)→可配置目标分辨率
 # =========================================================================
 
 class ProgressiveDecoder(nn.Module):
@@ -200,24 +199,25 @@ class ProgressiveDecoder(nn.Module):
 
 class SparseViewReconstruction(nn.Module):
     """
-    v3: 单BP→64³ → HF(64³码本)+MF(↑128³码本) → Add融合 → 512³
+    单BP→64³ → HF(64³码本)+MF(↑128³码本) → Add融合 → 可配置目标分辨率
 
     阶段控制:
       stage1: 训练全部 (码本可学习)
-      stage2: 冻结码本, 微调其他
-      stage3: 全冻结, 纯推理
+      stage2: 冻结 EMA 码字更新, 微调编码器/解码器和量化适配层
+      stage3: 冻结 EMA 码字和量化适配层, 微调编码器/解码器
     """
 
-    def __init__(self, n_decoder_ups=2):
+    def __init__(self, n_decoder_ups=2, transformer_layers=4):
         """
         n_decoder_ups: 解码器上采样次数
           1: 128³→256³ (推荐8GB显卡测试)
           2: 128³→256³→512³ (需要≥16GB)
+        transformer_layers: 跨视角 TransformerEncoderLayer 堆叠数
         """
         super().__init__()
         # ---- 1. 2D CNN + Transformer ----
         self.cnn = MultiScaleCNN2D()
-        self.transformer = ViewTransformer()
+        self.transformer = ViewTransformer(num_layers=transformer_layers)
 
         # ---- 2. 单反投影 → 64³ ----
         self.backproj = BackProjection3D(in_ch=256, mid_ch=128, out_ch=64, vol_depth=64)
@@ -239,18 +239,7 @@ class SparseViewReconstruction(nn.Module):
         # ---- 5. 渐进式解码器 ----
         self.decoder = ProgressiveDecoder(hf_ch=128, mf_ch=64, n_ups=n_decoder_ups)
 
-        # 对齐层
-        self.align_hf = nn.Identity()  # 128→128, no change needed
-        self.align_mf = nn.Conv3d(64, 64, 1)                        # 64→64, no change
-
-    def forward(self, projs, n_views=None):
-        B, V_total = projs.shape[:2]
-
-        # 视角采样
-        if n_views is not None and n_views < V_total:
-            idx = torch.linspace(0, V_total-1, n_views, dtype=torch.long, device=projs.device)
-            projs = projs[:, idx]
-
+    def forward(self, projs):
         # ---- 1. CNN + Transformer ----
         feat = self.cnn(projs)                                      # (B, V, 256, 64, 64)
         feat = self.transformer(feat)
@@ -270,7 +259,7 @@ class SparseViewReconstruction(nn.Module):
         perplexity = (perp_hf + perp_mf) / 2.0
 
         # ---- 4. 渐进式解码 (Add融合) ----
-        out = self.decoder(A_hf, B_mf, vol)                         # (B, 1, 512³)
+        out = self.decoder(A_hf, B_mf, vol)                         # (B, 1, target³)
 
         return out, vq_loss, perplexity
 
@@ -278,12 +267,33 @@ class SparseViewReconstruction(nn.Module):
         """阶段2: 冻结双码本 (停止 EMA 更新)"""
         self.codebook_hf.freeze()
         self.codebook_mf.freeze()
-        print('[Stage 2] Codebooks frozen (EMA updates disabled).')
+        print('[Codebooks] EMA updates disabled.')
+
+    def unfreeze_codebooks(self):
+        """Enable EMA codeword updates."""
+        self.codebook_hf.unfreeze()
+        self.codebook_mf.unfreeze()
+
+    def set_codebook_adapters_trainable(self, trainable):
+        """Toggle pre/post-quantization convolutions; EMA tensors stay non-gradient."""
+        self.codebook_hf.set_adapter_trainable(trainable)
+        self.codebook_mf.set_adapter_trainable(trainable)
+
+    def codebook_diagnostics(self):
+        """Diagnostics from the latest HF/MF quantizer forward pass."""
+        diagnostics = {}
+        for prefix, codebook in (
+            ('hf', self.codebook_hf),
+            ('mf', self.codebook_mf),
+        ):
+            for name, value in codebook.diagnostics().items():
+                diagnostics[f'{prefix}_{name}'] = value
+        return diagnostics
 
     def freeze_encoder(self):
-        """阶段3: 冻结编码器+码本, 仅保留decoder可训(可选)"""
+        """Optional decoder-only mode; not used by the default three-stage training."""
         for p in self.cnn.parameters(): p.requires_grad = False
         for p in self.transformer.parameters(): p.requires_grad = False
         for p in self.backproj.parameters(): p.requires_grad = False
         self.freeze_codebooks()
-        print('[Stage 3] Encoder + Codebooks frozen.')
+        print('[Optional] Encoder + EMA codewords frozen; decoder remains trainable.')

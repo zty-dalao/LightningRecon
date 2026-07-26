@@ -18,6 +18,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from PIL import Image
+from src.view_protocol import uniform_view_indices
 
 # NumPy pickle 兼容 (旧版 numpy._core 别名)
 if 'numpy._core.numeric' not in sys.modules:
@@ -33,6 +34,8 @@ class ThoraxCTDataset(Dataset):
     每个样本:
       - projs:  (V, 1, H_proj, W_proj)  投影图, float32 [-1, 1]
       - ct:     (1, D, H, W)             CT 标签体, float32 [0, 1]
+      - mask:   (1, D, H, W)             body mask；缺失时为全1
+      - mask_available: bool              是否存在真实 body mask
 
     Args:
         data_root:  thorax/ 目录绝对路径
@@ -45,13 +48,21 @@ class ThoraxCTDataset(Dataset):
     """
     def __init__(self, data_root, split='train', n_views=-1,
                  proj_size=(256, 256), vol_size=(128, 128, 128),
-                 val_ratio=0.1, seed=42):
+                 val_ratio=0.1, seed=42, expected_source_views=None,
+                 view_counts=None):
         super().__init__()
         self.data_root = data_root
         self.split = split
         self.n_views = n_views
         self.proj_size = proj_size
         self.vol_size = vol_size
+        self.expected_source_views = expected_source_views
+        self.view_counts = (
+            tuple(sorted({int(value) for value in view_counts}, reverse=True))
+            if view_counts is not None else None
+        )
+        if self.view_counts is not None and n_views != -1:
+            raise ValueError('Use either n_views or view_counts, not both')
 
         # ---- 目录 ----
         proj_dir = os.path.join(data_root, 'projections')
@@ -77,14 +88,21 @@ class ThoraxCTDataset(Dataset):
         splits_path = os.path.join(data_root, 'splits.json')
         meta_path   = os.path.join(data_root, 'meta_info.json')
         split_source = None
+        metadata_found = False
         for sp in [splits_path, meta_path]:
             if os.path.exists(sp):
+                metadata_found = True
                 with open(sp) as f:
                     d = json.load(f)
                 if split in d:
                     self.cases = [c for c in d[split] if c in valid_cases]
                     split_source = os.path.basename(sp)
                     break
+        if split_source is None and metadata_found:
+            raise KeyError(
+                f'Existing split metadata does not define split={split!r}; '
+                'refusing to silently create a different random partition.'
+            )
         if split_source is None:
             # 自动划分
             rng = np.random.default_rng(seed)
@@ -100,6 +118,8 @@ class ThoraxCTDataset(Dataset):
             }
             self.cases = [valid_cases[i] for i in mapping.get(split, [])]
             split_source = 'auto'
+        if not self.cases:
+            raise RuntimeError(f'Split {split!r} contains no valid cases')
         print(f'[ThoraxCTDataset] [{split}] {len(self.cases)} 例 (划分: {split_source})')
 
         self._proj_dir = proj_dir
@@ -110,14 +130,43 @@ class ThoraxCTDataset(Dataset):
 
         # ---- 预扫描投影数 ----
         self._max_projs = 0
+        self._min_projs = float('inf')
         self._case_angles = {}
         for case in self.cases:
             with open(os.path.join(proj_dir, f'{case}.pickle'), 'rb') as f:
                 data = pickle.load(f)
             n = len(data['projs'])
+            angles = np.asarray(data['angles'])
+            if len(angles) != n:
+                raise ValueError(
+                    f'{case}: projections/angles length mismatch '
+                    f'({n} vs {len(angles)})'
+                )
+            if expected_source_views is not None and n != expected_source_views:
+                raise ValueError(
+                    f'{case}: expected exactly {expected_source_views} source '
+                    f'views, found {n}'
+                )
+            if self.view_counts is not None:
+                invalid_counts = [
+                    count for count in self.view_counts
+                    if count <= 0 or count > n
+                ]
+                if invalid_counts:
+                    raise ValueError(
+                        f'{case}: invalid requested view counts '
+                        f'{invalid_counts} for {n} source views'
+                    )
             self._max_projs = max(self._max_projs, n)
-            self._case_angles[case] = data['angles']
-        print(f'[ThoraxCTDataset] 最大投影数: {self._max_projs}')
+            self._min_projs = min(self._min_projs, n)
+            self._case_angles[case] = angles
+        if self._min_projs != self._max_projs:
+            raise ValueError(
+                f'Split {split!r} mixes projection counts '
+                f'({self._min_projs}..{self._max_projs}); batching would not '
+                'preserve a single source grid.'
+            )
+        print(f'[ThoraxCTDataset] 原始投影数: {self._max_projs}')
 
     def __len__(self):
         return len(self.cases)
@@ -126,23 +175,50 @@ class ThoraxCTDataset(Dataset):
     def max_views(self):
         return self._max_projs
 
+    @property
+    def min_views(self):
+        return self._min_projs
+
+    def ct_path(self, case_id):
+        if case_id not in self.cases:
+            raise ValueError(f'Case {case_id!r} is not part of split {self.split!r}')
+        return os.path.join(self._ct_dir, f'{case_id}.nii.gz')
+
     # =====================================================================
     # 投影加载 (pickle)
     # =====================================================================
+    @staticmethod
+    def _uniform_indices(total, n_views):
+        """Return deterministic, approximately uniform indices over a full rotation."""
+        if n_views < 0 or n_views >= total:
+            return np.arange(total, dtype=np.int64)
+        return np.asarray(
+            uniform_view_indices(total,n_views),dtype=np.int64
+        )
+
     def _load_projections(self, case_id):
         path = os.path.join(self._proj_dir, f'{case_id}.pickle')
         with open(path, 'rb') as f:
             data = pickle.load(f)
         projs = data['projs'].astype(np.float32)      # uint8 → float32 [K, W, H]
+        angles = np.asarray(data['angles'], dtype=np.float32)
         projs_max = float(data['projs_max'])
         total = len(projs)
+        if len(angles) != total:
+            raise ValueError(
+                f'{case_id}: projections/angles length mismatch '
+                f'({total} vs {len(angles)})'
+            )
 
         # ---- 采样 ----
-        if self.n_views < 0 or self.n_views >= total:
-            indices = list(range(total))
+        if self.view_counts is None:
+            indices = self._uniform_indices(total, self.n_views)
         else:
-            rng = np.random.default_rng()
-            indices = sorted(rng.choice(total, self.n_views, replace=False).tolist())
+            indices = np.asarray(sorted({
+                index
+                for count in self.view_counts
+                for index in uniform_view_indices(total, count)
+            }), dtype=np.int64)
 
         # ---- 逐帧处理 ----
         out = []
@@ -155,13 +231,13 @@ class ThoraxCTDataset(Dataset):
             img = Image.fromarray(arr)
             img = img.resize(self.proj_size[::-1], Image.BILINEAR)
             out.append(np.array(img, dtype=np.float32))
-        return np.stack(out, axis=0)                    # (V, H, W)
+        return np.stack(out, axis=0), angles[indices], indices
 
     # =====================================================================
     # CT 体素加载 (NIfTI uint8)
     # =====================================================================
     def _load_ct(self, case_id):
-        path = os.path.join(self._ct_dir, f'{case_id}.nii.gz')
+        path = self.ct_path(case_id)
         try:
             import nibabel as nib
             nii = nib.load(path)
@@ -171,7 +247,18 @@ class ThoraxCTDataset(Dataset):
             import SimpleITK as sitk
             vol = sitk.GetArrayFromImage(sitk.ReadImage(path)).astype(np.float32)
 
-        # uint8 [0,255] → [0,1]
+        value_min = float(np.nanmin(vol))
+        value_max = float(np.nanmax(vol))
+        if not np.isfinite(value_min) or not np.isfinite(value_max):
+            raise ValueError(f'{case_id}: CT contains NaN or infinite values')
+        if value_min < -1e-3 or value_max > 255.0 + 1e-3:
+            raise ValueError(
+                f'{case_id}: CT range [{value_min:.3f}, {value_max:.3f}] is '
+                'not uint8-like [0,255]. Convert it explicitly or change the '
+                'normalization instead of silently dividing HU values by 255.'
+            )
+
+        # uint8-like [0,255] → normalized [0,1]
         vol = vol / 255.0
 
         # resize
@@ -201,53 +288,22 @@ class ThoraxCTDataset(Dataset):
 
     def __getitem__(self, index):
         case_id = self.cases[index]
-        projs = self._load_projections(case_id)           # (V, H, W)
+        projs, angles, view_indices = self._load_projections(case_id)
         ct    = self._load_ct(case_id)                    # (D, H, W)
         mask  = self._load_mask(case_id)                  # (D, H, W) or None
         result = {
             'case_id': case_id,
             'projs': torch.from_numpy(projs).unsqueeze(1),  # (V, 1, H, W)
+            'angles': torch.from_numpy(angles),              # (V,), radians
+            'view_indices': torch.from_numpy(view_indices),  # (V,), original grid
             'ct':    torch.from_numpy(ct).unsqueeze(0),      # (1, D, H, W)
         }
-        if mask is not None:
-            result['mask'] = torch.from_numpy(mask).unsqueeze(0)  # (1, D, H, W)
+        if mask is None:
+            # An all-ones mask is equivalent to the previous unmasked training
+            # loss and keeps dictionary keys collatable for batch_size > 1.
+            result['mask'] = torch.ones_like(result['ct'])
+            result['mask_available'] = torch.tensor(False)
+        else:
+            result['mask'] = torch.from_numpy(mask).unsqueeze(0)
+            result['mask_available'] = torch.tensor(True)
         return result
-
-
-# =====================================================================
-# 兼容别名 (旧代码引用 PairedCBCTDataset 时自动映射)
-# =====================================================================
-PairedCBCTDataset = ThoraxCTDataset
-
-
-# =====================================================================
-# 测试入口
-# =====================================================================
-if __name__ == '__main__':
-    import argparse
-    p = argparse.ArgumentParser()
-    p.add_argument('--data_root', type=str, default='/root/autodl-tmp/thorax')
-    args = p.parse_args()
-
-    print('=' * 60)
-    print('测试 ThoraxCTDataset')
-    print('=' * 60)
-
-    train_set = ThoraxCTDataset(data_root=args.data_root, split='train',
-                                n_views=50, proj_size=(256, 256), vol_size=(128, 128, 128))
-    print(f'训练集: {len(train_set)} 例, max_views={train_set.max_views}')
-
-    s = train_set[0]
-    print(f'case_id: {s["case_id"]}')
-    print(f'projs:   {s["projs"].shape}  dtype={s["projs"].dtype}  '
-          f'range=[{s["projs"].min():.3f}, {s["projs"].max():.3f}]')
-    print(f'ct:      {s["ct"].shape}    dtype={s["ct"].dtype}    '
-          f'range=[{s["ct"].min():.3f}, {s["ct"].max():.3f}]')
-
-    test_set = ThoraxCTDataset(data_root=args.data_root, split='test',
-                               n_views=6, proj_size=(256, 256), vol_size=(128, 128, 128))
-    print(f'\n测试集: {len(test_set)} 例')
-    st = test_set[0]
-    print(f'projs: {st["projs"].shape}')
-
-    print('\n✓ 数据加载测试通过')

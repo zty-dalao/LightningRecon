@@ -1,14 +1,16 @@
 """
-训练脚本 v4: 三阶段训练 + 平滑视角衰减 + Charbonnier 主损失
+训练脚本: 固定等间隔厂家协议 + 三阶段训练 + Charbonnier 主损失
 
-阶段1 (Stage1): 64 views, 码本学习, L_img 主导
-阶段2 (Stage2): 平滑降 view (64→56→48→...→6), 码本低LR
-阶段3 (Stage3): 6 views 固定微调, 码本冻结
+阶段1 (Stage1): 60/64 views, EMA码字学习, L_img 主导
+阶段2 (Stage2): 内置课程逐级降至目标视角, EMA码字冻结
+阶段3 (Stage3): 目标视角固定微调, EMA码字和量化适配层冻结
 
 核心改动:
   - L_img (Charbonnier, mask 内) 为主损失 (w=1.0)
-  - 视角平滑递减，避免 64→6 跳变
-  - 按 Eval Mask PSNR 选最佳 checkpoint
+  - 投影与真实物理角度始终绑定
+  - 每个阶段直接从原始 source_views 网格等间隔采样
+  - val 始终使用 --final_view 选择 checkpoint；test 仅在结束时评估
+  - best/periodic/last checkpoint 均可完整恢复训练
   - Warmup + CosineAnnealingLR, 每阶段重置
   - 分组学习率 (encoder / codebook / decoder)
 
@@ -17,39 +19,118 @@
       --stage1_epochs 150 --stage2_epochs_per_view 30 --stage3_epochs 100
 """
 
-import os, sys, argparse, json, math
+import os, sys, argparse, json, re, random
 import numpy as np
 import torch, torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from torch.cuda.amp import GradScaler, autocast
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.models import SparseViewReconstruction
 from src.dataset import ThoraxCTDataset
-from src.losses import ReconstructionLoss
+from src.losses import ReconstructionLoss, ssim_3d_per_case
+from src.view_protocol import (
+    resolve_view_curriculum,
+    uniform_view_indices as protocol_view_indices,
+)
 
 
 # =========================================================================
 # 工具
 # =========================================================================
 
-def add_angle_encoding(projs, V_total, device):
+def validate_run_version(run_version):
+    """Require explicit monotonically named versions such as v2 or v3."""
+    if not re.fullmatch(r'v[1-9]\d*',run_version or ''):
+        raise ValueError(
+            f'run_version must look like v1, v2, v3, ...; got {run_version!r}'
+        )
+    return run_version
+
+
+def build_run_name(organ, final_view, out_res, run_version):
+    version=validate_run_version(run_version)
+    return f'{organ}_finalview={final_view}_{out_res}_{version}'
+
+
+def build_tensorboard_command(tensorboard_dir):
+    """Return the exact command for viewing only this versioned run."""
+    return f'tensorboard --logdir "{os.path.abspath(tensorboard_dir)}"'
+
+
+def checkpoint_name(kind, final_view, run_version, epoch=None):
+    version=validate_run_version(run_version)
+    suffix=f'finalview={final_view}_{version}'
+    if kind=='best':
+        return f'best_model_{suffix}.pth'
+    if kind=='last':
+        return f'last_model_{suffix}.pth'
+    if kind=='epoch' and epoch is not None:
+        return f'ckpt_{epoch:04d}_{suffix}.pth'
+    raise ValueError(f'Unsupported checkpoint kind={kind!r}, epoch={epoch!r}')
+
+
+def add_angle_encoding(projs, angles):
+    """Append sin/cos maps from the physical acquisition angles (radians)."""
     B, V, _, H, W = projs.shape
-    theta = torch.linspace(0, 2 * torch.pi, V_total + 1, device=device)[:V]
-    s = torch.sin(theta).view(1, -1, 1, 1, 1).expand(B, -1, 1, H, W)
-    c = torch.cos(theta).view(1, -1, 1, 1, 1).expand(B, -1, 1, H, W)
+    if angles.dim() == 1:
+        angles = angles.unsqueeze(0)
+    if angles.shape != (B, V):
+        raise ValueError(
+            f'Expected angles shape {(B, V)}, got {tuple(angles.shape)}'
+        )
+    theta = angles.to(device=projs.device, dtype=projs.dtype)
+    s = torch.sin(theta).view(B, V, 1, 1, 1).expand(-1, -1, 1, H, W)
+    c = torch.cos(theta).view(B, V, 1, 1, 1).expand(-1, -1, 1, H, W)
     return torch.cat([projs, s, c], dim=2)
 
 
-def subsample_projections(projs, n_keep, device):
+def uniform_view_indices(total_views, n_keep, device):
+    """Fixed approximately uniform indices, preserving acquisition phase."""
+    indices=protocol_view_indices(total_views,n_keep)
+    return torch.tensor(indices,device=device,dtype=torch.long)
+
+
+def subsample_projections(
+    projs, n_keep, device, angles=None, *,
+    source_total=None, view_indices=None,
+):
+    """Select a direct source-grid protocol and keep projections/angles paired."""
     if projs.dim() != 5:
         raise ValueError(f'Expected 5D, got {tuple(projs.shape)}')
-    B, V_total, C, H, W = projs.shape
-    if n_keep >= V_total:
-        return projs[:, :V_total].contiguous()
-    idx = torch.randperm(V_total, device=device)[:n_keep].sort().values
-    return projs.index_select(1, idx).contiguous()
+    V_total = projs.shape[1]
+    if view_indices is None:
+        idx = uniform_view_indices(V_total, n_keep, device)
+    else:
+        if source_total is None:
+            raise ValueError('source_total is required with view_indices')
+        if view_indices.dim() == 1:
+            available = view_indices
+        elif view_indices.dim() == 2:
+            if not torch.equal(
+                view_indices, view_indices[0].expand_as(view_indices)
+            ):
+                raise ValueError('Batch cases do not share the same source grid')
+            available = view_indices[0]
+        else:
+            raise ValueError(
+                f'Expected 1D/2D view_indices, got {tuple(view_indices.shape)}'
+            )
+        available = available.to(device)
+        target = uniform_view_indices(source_total, n_keep, device)
+        matches = available[:, None].eq(target[None, :])
+        if not torch.all(matches.sum(dim=0) == 1):
+            missing = target[matches.sum(dim=0) != 1].tolist()
+            raise ValueError(
+                f'Loaded projection union does not contain the direct '
+                f'{source_total}->{n_keep} protocol; missing indices={missing}'
+            )
+        idx = matches.to(torch.int64).argmax(dim=0)
+    sampled_projs = projs.index_select(1, idx).contiguous()
+    if angles is None:
+        return sampled_projs
+    sampled_angles = angles.index_select(1, idx).contiguous()
+    return sampled_projs, sampled_angles
 
 
 def _psnr(p, t, mask=None):
@@ -74,69 +155,213 @@ def _mae(p, t, mask):
 # 视角调度
 # =========================================================================
 
-def auto_decay_views(start, end, steps):
-    """
-    根据步长序列自动生成视角衰减序列。
-
-    steps=[8,4,2] 意为:
-      - 阶段 A: 步长 8, 从 start 递减, 直到 next_step*3 (如 4*3=12)
-      - 阶段 B: 步长 4, 继续递减, 直到 next_step*3 (如 2*3=6)
-      - 阶段 C: 步长 2, 递减到 end
-
-    示例: start=64, end=6, steps=[8,4,2]
-      → [56, 48, 40, 32, 24,  20, 16, 12,  10, 8, 6]
-    """
-    views = []
-    current = start
-    for i, step in enumerate(steps):
-        # 当前步长适用到 step*3 (如步长8→24, 步长4→12, 步长2→6)
-        lower = max(end, step * 3)
-        while current - step >= lower:
-            current -= step
-            views.append(current)
-    while current > end:
-        current = max(end, current - steps[-1])
-        views.append(current)
-    return views
-
-
 def build_view_schedule(args):
     """返回 [(start_epoch, end_epoch, n_views, stage), ...]"""
-    schedule = []
+    views=resolve_view_curriculum(
+        args.final_view,args.view_schedule,max_views=64
+    )
+    schedule=[]
     s1_end = args.stage1_epochs
-    schedule.append((1, s1_end, args.stage1_views, 1))
+    schedule.append((1,s1_end,views[0],1))
 
-    if args.stage2_view_decay:
-        parts = [int(v) for v in args.stage2_view_decay.split(',')]
-        # 自动检测: 元素少且值小 → 步长模式; 否则 → 显式列表
-        if len(parts) <= 3 and all(p <= 16 for p in parts):
-            views = auto_decay_views(args.stage1_views, args.train_views, parts)
-        else:
-            views = parts
-        ep_per_view = args.stage2_epochs_per_view
-        cur = s1_end + 1
-        for nv in views:
-            schedule.append((cur, cur + ep_per_view - 1, nv, 2))
-            cur += ep_per_view
+    ep_per_view=args.stage2_epochs_per_view
+    cur=s1_end+1
+    for nv in views[1:]:
+        schedule.append((cur,cur+ep_per_view-1,nv,2))
+        cur+=ep_per_view
 
     if args.stage3_epochs > 0:
         s2_end = schedule[-1][1] if len(schedule) > 1 else s1_end
-        schedule.append((s2_end + 1, s2_end + args.stage3_epochs, args.train_views, 3))
+        schedule.append((
+            s2_end+1,s2_end+args.stage3_epochs,args.final_view,3
+        ))
 
     return schedule
 
 
 def get_stage_config(stage):
-    """(loss_weights_dict, lr_dict, freeze_codebook)"""
+    """(loss weights, learning rates, freeze EMA, freeze quantizer adapters)."""
     if stage == 1:
-        return ({'w_img': 1.0, 'w_lap': 0.05, 'w_struct': 0.10, 'w_vq': 0.05},
-                {'encoder': 1e-4, 'codebook': 1e-4}, False)
+        return ({'w_img': 1.0, 'w_lap': 0.05, 'w_struct': 0.05, 'w_vq': 0.05},
+                {'encoder': 1e-4, 'codebook': 1e-4, 'decoder': 1e-4},
+                False, False)
     elif stage == 2:
         return ({'w_img': 1.0, 'w_lap': 0.04, 'w_struct': 0.08, 'w_vq': 0.02},
-                {'encoder': 5e-5, 'codebook': 5e-6}, False)
+                {'encoder': 5e-5, 'codebook': 5e-6, 'decoder': 5e-5},
+                True, False)
     else:
         return ({'w_img': 1.0, 'w_lap': 0.02, 'w_struct': 0.05, 'w_vq': 0.0},
-                {'encoder': 1e-5, 'decoder': 2e-5}, True)
+                {'encoder': 1e-5, 'decoder': 2e-5},
+                True, True)
+
+
+def configure_stage(model, criterion, stage, view_schedule):
+    """Apply freezing/loss policy and create the stage optimizer/scheduler."""
+    loss_weights, lr_cfg, freeze_ema, freeze_cb_adapters = get_stage_config(stage)
+    criterion.set_weights(**loss_weights)
+    if freeze_ema:
+        model.freeze_codebooks()
+    else:
+        model.unfreeze_codebooks()
+    model.set_codebook_adapters_trainable(not freeze_cb_adapters)
+
+    decoder_ids = {id(parameter) for parameter in model.decoder.parameters()}
+    codebook_modules = [model.codebook_hf, model.codebook_mf]
+    codebook_ids = {
+        id(parameter)
+        for codebook in codebook_modules
+        for parameter in codebook.parameters()
+    }
+    encoder_parameters = [
+        parameter
+        for parameter in model.parameters()
+        if parameter.requires_grad
+        and id(parameter) not in codebook_ids
+        and id(parameter) not in decoder_ids
+    ]
+    codebook_parameters = [
+        parameter
+        for codebook in codebook_modules
+        for parameter in codebook.parameters()
+        if parameter.requires_grad
+    ]
+    decoder_parameters = [
+        parameter
+        for parameter in model.decoder.parameters()
+        if parameter.requires_grad
+    ]
+    parameter_groups = []
+    if encoder_parameters:
+        parameter_groups.append({
+            'params': encoder_parameters,
+            'lr': lr_cfg['encoder'],
+            'name': 'encoder',
+        })
+    if codebook_parameters:
+        parameter_groups.append({
+            'params': codebook_parameters,
+            'lr': lr_cfg.get('codebook', lr_cfg['encoder']),
+            'name': 'codebook',
+        })
+    if decoder_parameters:
+        parameter_groups.append({
+            'params': decoder_parameters,
+            'lr': lr_cfg.get('decoder', lr_cfg['encoder']),
+            'name': 'decoder',
+        })
+    optimizer = torch.optim.AdamW(parameter_groups, weight_decay=1e-5)
+
+    stage_start = min(
+        start for start, _, _, item_stage in view_schedule
+        if item_stage == stage
+    )
+    stage_end = max(
+        end for _, end, _, item_stage in view_schedule
+        if item_stage == stage
+    )
+    stage_epochs = stage_end - stage_start + 1
+    warmup_epochs = min(5, max(1, stage_epochs // 4))
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        [
+            torch.optim.lr_scheduler.LinearLR(
+                optimizer, start_factor=0.1, total_iters=warmup_epochs
+            ),
+            torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=max(1, stage_epochs - warmup_epochs)
+            ),
+        ],
+        milestones=[warmup_epochs],
+    )
+    return optimizer, scheduler, loss_weights, freeze_ema, freeze_cb_adapters
+
+
+def capture_rng_state():
+    state = {
+        'python': random.getstate(),
+        'numpy': np.random.get_state(),
+        'torch': torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state['cuda'] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_rng_state(state):
+    if not state:
+        return
+    random.setstate(state['python'])
+    np.random.set_state(state['numpy'])
+    torch.set_rng_state(state['torch'].cpu())
+    if torch.cuda.is_available() and 'cuda' in state:
+        torch.cuda.set_rng_state_all(
+            [cuda_state.cpu() for cuda_state in state['cuda']]
+        )
+
+
+def checkpoint_payload(
+    *,
+    epoch,
+    model,
+    optimizer,
+    scheduler,
+    scaler,
+    args,
+    run_name,
+    stage,
+    current_train_views,
+    resolved_views,
+    best_metric,
+    best_epoch,
+    eval_metrics=None,
+):
+    """Build a fully resumable, self-describing training checkpoint."""
+    return {
+        'checkpoint_format': 3,
+        'epoch': epoch,
+        'model_state': model.state_dict(),
+        'optimizer_state': optimizer.state_dict(),
+        'scheduler_state': scheduler.state_dict(),
+        'scaler_state': scaler.state_dict() if scaler is not None else None,
+        'rng_state': capture_rng_state(),
+        'run_name': run_name,
+        'run_version': args.run_version,
+        'final_view': args.final_view,
+        'best_mask_psnr': best_metric,
+        'best_epoch': best_epoch,
+        'stage': stage,
+        'current_train_views': current_train_views,
+        'eval_views': args.final_view,
+        'source_views': args.source_views,
+        'resolved_view_schedule': resolved_views,
+        'sampling_protocol': 'direct_uniform_from_source_grid',
+        'model_config': {
+            'n_decoder_ups': args.n_decoder_ups,
+            'transformer_layers': args.transformer_layers,
+            'proj_size': list(args.proj_size),
+            'vol_size': list(args.vol_size),
+        },
+        'training_config': {
+            'stage1_epochs': args.stage1_epochs,
+            'stage2_epochs_per_view': args.stage2_epochs_per_view,
+            'stage3_epochs': args.stage3_epochs,
+            'batch_size': args.batch_size,
+            'grad_accum': args.grad_accum,
+            'amp': scaler is not None,
+        },
+        'ct_normalization': {
+            'stored_range': [0.0, 255.0],
+            'network_range': [0.0, 1.0],
+            'hu_range': list(args.ct_range),
+        },
+        'eval_metrics': eval_metrics,
+    }
+
+
+def load_training_checkpoint(path, device):
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f'Resume checkpoint not found: {path}')
+    return torch.load(path, map_location=device)
 
 
 # =========================================================================
@@ -144,32 +369,88 @@ def get_stage_config(stage):
 # =========================================================================
 
 @torch.no_grad()
-def evaluate(model, loader, device, criterion):
+def evaluate(model, loader, device, criterion, n_views, source_total=None):
+    """Evaluate a fixed deployment protocol at exactly ``n_views`` views."""
     model.eval()
-    m = {'psnr':0,'psnr_mask':0,'ssim':0,'mae_mask':0,
-         'total':0,'img':0,'lap':0,'struct':0,'c':0,'c_mask':0}
+    m = {'psnr':0,'psnr_mask':0,'ssim':0,'ssim_mask':0,'mae_mask':0,
+         'total':0,'img':0,'lap':0,'struct':0,'perplexity':0,
+         'c':0,'c_mask':0,'c_ssim_mask':0}
     for batch in loader:
         projs=batch['projs'].to(device); ct=batch['ct'].to(device)
+        angles=batch['angles'].to(device)
+        view_indices=batch.get('view_indices')
+        if view_indices is not None:
+            view_indices=view_indices.to(device)
         mask=batch.get('mask')
         if mask is not None: mask=mask.to(device)
-        projs_enc=add_angle_encoding(projs, projs.shape[1], device)
-        pred, vq, _ = model(projs_enc)
+        mask_available=batch.get('mask_available')
+        if mask_available is None:
+            mask_available=torch.full(
+                (projs.shape[0],),mask is not None,
+                dtype=torch.bool,device=device,
+            )
+        else:
+            mask_available=mask_available.to(device).bool()
+        if projs.shape[1] < n_views:
+            raise ValueError(
+                f'Validation sample has {projs.shape[1]} views, '
+                f'but {n_views} were requested'
+            )
+        projs,angles=subsample_projections(
+            projs,n_views,device,angles,
+            source_total=source_total,
+            view_indices=view_indices,
+        )
+        projs_enc=add_angle_encoding(projs,angles)
+        pred,vq,perplexity=model(projs_enc)
         ct_a=nn.functional.interpolate(ct, size=pred.shape[2:], mode='trilinear')
         mask_a=nn.functional.interpolate(mask, size=pred.shape[2:], mode='nearest') if mask is not None else None
-        loss=criterion(pred, ct_a, vq, mask_a); B=projs.shape[0]
-        m['psnr']+=_psnr(pred, ct_a)*B
+        loss=criterion(
+            pred,ct_a,vq,mask_a,compute_metrics=False
+        )
+        B=projs.shape[0]
+        whole_ssim_scores,masked_ssim_scores=ssim_3d_per_case(
+            pred,ct_a,mask_a
+        )
+        for sample_index in range(B):
+            m['psnr']+=float(_psnr(
+                pred[sample_index:sample_index+1],
+                ct_a[sample_index:sample_index+1],
+            ))
+        m['ssim']+=float(whole_ssim_scores.sum())
         if mask_a is not None:
-            pm=_psnr(pred, ct_a, mask_a)
-            if not np.isnan(float(pm)):
-                m['psnr_mask']+=float(pm)*B; m['mae_mask']+=_mae(pred, ct_a, mask_a)*B; m['c_mask']+=B
-        for k in ['ssim','total','img','lap','struct']:
+            for sample_index in range(B):
+                if not bool(mask_available[sample_index]):
+                    continue
+                sample_mask=mask_a[sample_index:sample_index+1]
+                sample_pred=pred[sample_index:sample_index+1]
+                sample_ct=ct_a[sample_index:sample_index+1]
+                pm=_psnr(sample_pred,sample_ct,sample_mask)
+                if not np.isnan(float(pm)):
+                    m['psnr_mask']+=float(pm)
+                    m['mae_mask']+=_mae(
+                        sample_pred,sample_ct,sample_mask
+                    )
+                    sample_ssim_mask=float(
+                        masked_ssim_scores[sample_index]
+                    )
+                    if not np.isnan(sample_ssim_mask):
+                        m['ssim_mask']+=sample_ssim_mask
+                        m['c_ssim_mask']+=1
+                    m['c_mask']+=1
+        for k in ['total','img','lap','struct']:
             v=loss[k]; m[k]+=(v.item() if isinstance(v, torch.Tensor) else v)*B
+        m['perplexity']+=float(perplexity)*B
         m['c']+=B
     return {'psnr':m['psnr']/m['c'],
             'psnr_mask':m['psnr_mask']/m['c_mask'] if m['c_mask']>0 else float('nan'),
             'mae_mask':m['mae_mask']/m['c_mask'] if m['c_mask']>0 else float('nan'),
+            'ssim_mask':m['ssim_mask']/m['c_ssim_mask']
+            if m['c_ssim_mask']>0 else float('nan'),
             'ssim':m['ssim']/m['c'], 'total':m['total']/m['c'],
-            'img':m['img']/m['c'], 'lap':m['lap']/m['c'], 'struct':m['struct']/m['c']}
+            'img':m['img']/m['c'], 'lap':m['lap']/m['c'],
+            'struct':m['struct']/m['c'],
+            'perplexity':m['perplexity']/m['c']}
 
 
 # =========================================================================
@@ -177,168 +458,546 @@ def evaluate(model, loader, device, criterion):
 # =========================================================================
 
 def train(args):
-    device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    view_schedule = build_view_schedule(args)
+    resolved_views = [nv for _, _, nv, stage in view_schedule if stage != 3]
+    if args.source_views < max(resolved_views):
+        raise ValueError(
+            f'source_views={args.source_views} is smaller than curriculum '
+            f'maximum {max(resolved_views)}'
+        )
+    if args.eval_every <= 0 or args.save_every <= 0:
+        raise ValueError('eval_every and save_every must be positive')
+    if args.transformer_layers <= 0:
+        raise ValueError('transformer_layers must be positive')
+    if args.ct_range[0] >= args.ct_range[1]:
+        raise ValueError(f'ct_range must be increasing, got {args.ct_range}')
+    total_epochs = view_schedule[-1][1]
+    organ = getattr(args, 'organ', 'thorax_fast')
+    out_res = 128 * (2 ** args.n_decoder_ups)
+    run_name = build_run_name(
+        organ, args.final_view, out_res, args.run_version
+    )
+    log_dir = os.path.join(args.log_dir, run_name)
+    resume_checkpoint = None
+    if args.resume:
+        resume_checkpoint = load_training_checkpoint(args.resume, device)
+        if int(resume_checkpoint.get('checkpoint_format', 0)) != 3:
+            raise ValueError(
+                'This checkpoint is not compatible with checkpoint_format=3. '
+                'Start a new training run with the cleaned model definition.'
+            )
+        for key, expected in (
+            ('run_version', args.run_version),
+            ('final_view', args.final_view),
+            ('source_views', args.source_views),
+        ):
+            actual = resume_checkpoint.get(key)
+            if actual is not None and actual != expected:
+                raise ValueError(
+                    f'Resume mismatch for {key}: checkpoint={actual!r}, '
+                    f'command line={expected!r}'
+                )
+        if resume_checkpoint.get('run_name') not in (None, run_name):
+            raise ValueError(
+                f'Resume checkpoint belongs to '
+                f'{resume_checkpoint.get("run_name")!r}, expected {run_name!r}'
+            )
+        if resume_checkpoint.get('resolved_view_schedule') != resolved_views:
+            raise ValueError(
+                'Resume view schedule differs from the checkpoint: '
+                f'{resume_checkpoint.get("resolved_view_schedule")} vs '
+                f'{resolved_views}'
+            )
+        expected_model_config = {
+            'n_decoder_ups': args.n_decoder_ups,
+            'transformer_layers': args.transformer_layers,
+            'proj_size': list(args.proj_size),
+            'vol_size': list(args.vol_size),
+        }
+        if resume_checkpoint.get('model_config') != expected_model_config:
+            raise ValueError(
+                'Resume model configuration differs from the checkpoint: '
+                f'{resume_checkpoint.get("model_config")} vs '
+                f'{expected_model_config}'
+            )
+        expected_training_config = {
+            'stage1_epochs': args.stage1_epochs,
+            'stage2_epochs_per_view': args.stage2_epochs_per_view,
+            'stage3_epochs': args.stage3_epochs,
+            'batch_size': args.batch_size,
+            'grad_accum': args.grad_accum,
+            'amp': bool(args.amp and device.type == 'cuda'),
+        }
+        if resume_checkpoint.get('training_config') != expected_training_config:
+            raise ValueError(
+                'Resume training configuration differs from the checkpoint: '
+                f'{resume_checkpoint.get("training_config")} vs '
+                f'{expected_training_config}'
+            )
+        saved_hu_range = (
+            resume_checkpoint.get('ct_normalization', {}).get('hu_range')
+        )
+        if saved_hu_range != list(args.ct_range):
+            raise ValueError(
+                f'Resume ct_range differs from the checkpoint: '
+                f'{saved_hu_range} vs {list(args.ct_range)}'
+            )
+    elif os.path.isdir(log_dir) and os.listdir(log_dir):
+        raise FileExistsError(
+            f'Run directory is not empty: {log_dir}. Use --resume to continue '
+            'this run or choose a new --run_version.'
+        )
 
-    # 数据集
-    load_views=max(args.stage1_views,
-        max(int(v) for v in args.stage2_view_decay.split(',')) if args.stage2_view_decay else 6)
-    proj_size=tuple(args.proj_size)
-    ts=ThoraxCTDataset(data_root=args.data_root, split='train', n_views=load_views,
-                       proj_size=proj_size, vol_size=args.vol_size)
-    vs=ThoraxCTDataset(data_root=args.data_root, split='test', n_views=load_views,
-                       proj_size=proj_size, vol_size=args.vol_size)
-    tl=DataLoader(ts, batch_size=args.batch_size, shuffle=True,
-                  num_workers=args.num_workers, pin_memory=True)
-    vl=DataLoader(vs, batch_size=args.batch_size, shuffle=False,
-                  num_workers=args.num_workers, pin_memory=True)
-    print(f'Train:{len(ts)} Test:{len(vs)}')
-    V_total=max(ts.max_views, vs.max_views)
-    print(f'Max views: {V_total}')
-
-    # 视角调度
-    view_schedule=build_view_schedule(args)
-    total_epochs=view_schedule[-1][1] if view_schedule else args.epochs
+    dataset_kwargs = {
+        'data_root': args.data_root,
+        'n_views': -1,
+        'proj_size': tuple(args.proj_size),
+        'vol_size': tuple(args.vol_size),
+        'expected_source_views': args.source_views,
+    }
+    train_set = ThoraxCTDataset(
+        split='train', view_counts=resolved_views, **dataset_kwargs
+    )
+    val_set = ThoraxCTDataset(
+        split='val', view_counts=(args.final_view,), **dataset_kwargs
+    )
+    test_set = ThoraxCTDataset(
+        split='test', view_counts=(args.final_view,), **dataset_kwargs
+    )
+    pin_memory = device.type == 'cuda'
+    train_loader = DataLoader(
+        train_set, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, pin_memory=pin_memory,
+    )
+    val_loader = DataLoader(
+        val_set, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=pin_memory,
+    )
+    test_loader = DataLoader(
+        test_set, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=pin_memory,
+    )
+    print(
+        f'Train:{len(train_set)} Val:{len(val_set)} Test:{len(test_set)} | '
+        f'source grid={args.source_views}'
+    )
+    train_union_size = len({
+        index
+        for count in resolved_views
+        for index in protocol_view_indices(args.source_views, count)
+    })
+    print(
+        f'Protocol: every phase samples directly from the '
+        f'{args.source_views}-view source grid; loaded train union='
+        f'{train_union_size} views; val/test={args.final_view} views'
+    )
     print(f'View schedule ({len(view_schedule)} phases, {total_epochs} epochs):')
-    for s,e,nv,st in view_schedule:
-        print(f'  E{s:4d}-{e:4d} ({e-s+1:3d}ep): {nv:2d}v, Stage {st}')
+    for start, end, n_views, stage in view_schedule:
+        print(
+            f'  E{start:4d}-{end:4d} ({end-start+1:3d}ep): '
+            f'{n_views:2d}v, Stage {stage}'
+        )
 
-    # 模型 + 损失
-    model=SparseViewReconstruction(n_decoder_ups=args.n_decoder_ups).to(device)
+    model = SparseViewReconstruction(
+        n_decoder_ups=args.n_decoder_ups,
+        transformer_layers=args.transformer_layers,
+    ).to(device)
+    criterion = ReconstructionLoss()
+    use_amp = bool(args.amp and device.type == 'cuda')
+    scaler = torch.amp.GradScaler('cuda') if use_amp else None
     print(f'Model: {sum(p.numel() for p in model.parameters()):,} params')
-    criterion=ReconstructionLoss()
 
-    # 日志
-    organ=getattr(args,'organ','thorax_fast')
-    out_res=128*(2**args.n_decoder_ups)
-    log_dir=os.path.join(args.log_dir, f'{organ}_{args.train_views}view_{out_res}')
     os.makedirs(log_dir, exist_ok=True)
-    writer=SummaryWriter(os.path.join(log_dir,'tensorboard'))
-    json.dump(vars(args)|{'train_cases':len(ts),'total_epochs':total_epochs,'V_total':V_total},
-              open(os.path.join(log_dir,'config.json'),'w'), indent=2)
+    tensorboard_dir = os.path.join(log_dir, 'tensorboard')
+    tensorboard_cmd = build_tensorboard_command(tensorboard_dir)
+    best_checkpoint = checkpoint_name(
+        'best', args.final_view, args.run_version
+    )
+    last_checkpoint = checkpoint_name(
+        'last', args.final_view, args.run_version
+    )
+    start_epoch = 1
+    best_metric = -float('inf')
+    best_epoch = 0
+    if resume_checkpoint is not None:
+        model.load_state_dict(resume_checkpoint['model_state'])
+        start_epoch = int(resume_checkpoint['epoch']) + 1
+        best_metric = float(
+            resume_checkpoint.get('best_mask_psnr', -float('inf'))
+        )
+        best_epoch = int(resume_checkpoint.get('best_epoch', 0))
+        if start_epoch > total_epochs:
+            print(
+                f'Checkpoint already reaches epoch {start_epoch - 1}; '
+                'skipping training and running the held-out test handoff.'
+            )
+        restore_rng_state(resume_checkpoint.get('rng_state'))
+        print(f'Resuming from epoch {start_epoch - 1}: {args.resume}')
 
-    scaler=GradScaler() if args.amp else None
-    best_mask_psnr=-float('inf'); best_epoch=0; prev_stage=None
-    accum=max(1, args.grad_accum)
+    writer = SummaryWriter(
+        tensorboard_dir,
+        purge_step=start_epoch if resume_checkpoint is not None else None,
+    )
+    writer.add_text(
+        'Run/Metadata',
+        '\n'.join([
+            f'- run_name: `{run_name}`',
+            f'- run_version: `{args.run_version}`',
+            f'- source_views: `{args.source_views}`',
+            f'- loaded_train_view_union: `{train_union_size}`',
+            f'- final_view: `{args.final_view}`',
+            f'- transformer_layers: `{args.transformer_layers}`',
+            f'- resolved_view_schedule: `{resolved_views}`',
+            f'- tensorboard: `{tensorboard_cmd}`',
+            f'- best_checkpoint: `{best_checkpoint}`',
+            f'- last_checkpoint: `{last_checkpoint}`',
+            f'- resumed_from: `{args.resume or "new run"}`',
+        ]),
+        max(0, start_epoch - 1),
+    )
+    config = vars(args).copy()
+    config.update({
+        'run_name': run_name,
+        'train_cases': len(train_set),
+        'val_cases': len(val_set),
+        'test_cases': len(test_set),
+        'total_epochs': total_epochs,
+        'sampling_protocol': 'direct_uniform_from_source_grid',
+        'loaded_train_view_union': train_union_size,
+        'eval_views': args.final_view,
+        'resolved_view_schedule': resolved_views,
+        'tensorboard_dir': tensorboard_dir,
+        'tensorboard_command': tensorboard_cmd,
+        'best_checkpoint': best_checkpoint,
+        'last_checkpoint': last_checkpoint,
+    })
+    with open(os.path.join(log_dir, 'config.json'), 'w') as handle:
+        json.dump(config, handle, indent=2)
+    print(f'TensorBoard for this run:\n  {tensorboard_cmd}')
 
-    for epoch in range(1, total_epochs+1):
-        # 查找当前阶段
-        cur_stage=None; cur_views=args.stage1_views
-        for s,e,nv,st in view_schedule:
-            if s<=epoch<=e: cur_stage,cur_views=st,nv; break
-        if cur_stage is None: break
+    accumulation_steps = max(1, args.grad_accum)
+    previous_stage = None
+    optimizer = None
+    scheduler = None
+    resume_optimizer_pending = resume_checkpoint is not None
+    last_epoch = (
+        int(resume_checkpoint['epoch'])
+        if resume_checkpoint is not None else 0
+    )
+    last_stage = (
+        int(resume_checkpoint['stage'])
+        if resume_checkpoint is not None else None
+    )
+    last_views = (
+        int(resume_checkpoint['current_train_views'])
+        if resume_checkpoint is not None else None
+    )
 
-        # 阶段切换
-        if cur_stage!=prev_stage:
-            lw,lr_cfg,freeze_cb=get_stage_config(cur_stage)
-            criterion.set_weights(**lw)
-            print(f'\n{"="*60}')
-            print(f'[Stage {cur_stage}] Epoch {epoch}: views={cur_views}')
-            print(f'  Loss: img={lw["w_img"]} lap={lw["w_lap"]} struct={lw["w_struct"]} vq={lw["w_vq"]}')
+    for epoch in range(start_epoch, total_epochs + 1):
+        current_stage = None
+        current_views = None
+        for start, end, n_views, stage in view_schedule:
+            if start <= epoch <= end:
+                current_stage, current_views = stage, n_views
+                break
+        if current_stage is None:
+            raise RuntimeError(f'No curriculum phase covers epoch {epoch}')
 
-            if freeze_cb:
-                model.freeze_codebooks(); print(f'  Codebook: frozen')
+        if current_stage != previous_stage:
+            (
+                optimizer,
+                scheduler,
+                loss_weights,
+                freeze_ema,
+                freeze_cb_adapters,
+            ) = configure_stage(
+                model, criterion, current_stage, view_schedule
+            )
+            if resume_optimizer_pending:
+                checkpoint_stage = int(resume_checkpoint['stage'])
+                if checkpoint_stage == current_stage:
+                    optimizer.load_state_dict(
+                        resume_checkpoint['optimizer_state']
+                    )
+                    scheduler.load_state_dict(
+                        resume_checkpoint['scheduler_state']
+                    )
+                    if scaler is not None and resume_checkpoint.get('scaler_state'):
+                        scaler.load_state_dict(
+                            resume_checkpoint['scaler_state']
+                        )
+                    print('Restored optimizer, scheduler, and AMP scaler state.')
+                resume_optimizer_pending = False
+            print(f'\n{"=" * 60}')
+            print(
+                f'[Stage {current_stage}] Epoch {epoch}: '
+                f'views={current_views}'
+            )
+            print(
+                f'  Loss: img={loss_weights["w_img"]} '
+                f'lap={loss_weights["w_lap"]} '
+                f'struct={loss_weights["w_struct"]} '
+                f'vq={loss_weights["w_vq"]}'
+            )
+            print(
+                f'  EMA codewords: {"frozen" if freeze_ema else "updating"} | '
+                f'quantizer adapters: '
+                f'{"frozen" if freeze_cb_adapters else "trainable"}'
+            )
+            previous_stage = current_stage
+
+        model.train()
+        epoch_sums = {
+            'total': 0.0, 'img': 0.0, 'lap': 0.0, 'struct': 0.0,
+            'vq': 0.0, 'weighted_img': 0.0,
+            'weighted_lap': 0.0, 'weighted_struct': 0.0,
+            'weighted_vq': 0.0,
+        }
+        diagnostic_sums = {}
+        optimizer.zero_grad()
+        for batch_index, batch in enumerate(train_loader):
+            source_projs = batch['projs']
+            source_angles = batch['angles']
+            if source_projs.shape[1] != batch['view_indices'].shape[1]:
+                raise ValueError(
+                    'Projection tensor and source-grid index union have '
+                    'different lengths'
+                )
+            projs, angles = subsample_projections(
+                source_projs, current_views,
+                torch.device('cpu'), source_angles,
+                source_total=args.source_views,
+                view_indices=batch['view_indices'],
+            )
+            projs = projs.to(device, non_blocking=pin_memory)
+            angles = angles.to(device, non_blocking=pin_memory)
+            ct = batch['ct'].to(device, non_blocking=pin_memory)
+            mask = batch.get('mask')
+            if mask is not None:
+                mask = mask.to(device, non_blocking=pin_memory)
+            projs_encoded = add_angle_encoding(projs, angles)
+
+            if use_amp:
+                with torch.amp.autocast('cuda'):
+                    pred, vq, _ = model(projs_encoded)
+                    ct_aligned = nn.functional.interpolate(
+                        ct, size=pred.shape[2:], mode='trilinear',
+                        align_corners=False,
+                    )
+                    mask_aligned = (
+                        nn.functional.interpolate(
+                            mask, size=pred.shape[2:], mode='nearest'
+                        )
+                        if mask is not None else None
+                    )
+                    losses = criterion(
+                        pred, ct_aligned, vq, mask_aligned,
+                        compute_metrics=False,
+                    )
+                scaler.scale(
+                    losses['total'] / accumulation_steps
+                ).backward()
             else:
-                for cb in [model.codebook_hf, model.codebook_mf]: cb.unfreeze()
-                print(f'  Codebook: trainable')
+                pred, vq, _ = model(projs_encoded)
+                ct_aligned = nn.functional.interpolate(
+                    ct, size=pred.shape[2:], mode='trilinear',
+                    align_corners=False,
+                )
+                mask_aligned = (
+                    nn.functional.interpolate(
+                        mask, size=pred.shape[2:], mode='nearest'
+                    )
+                    if mask is not None else None
+                )
+                losses = criterion(
+                    pred, ct_aligned, vq, mask_aligned,
+                    compute_metrics=False,
+                )
+                (losses['total'] / accumulation_steps).backward()
 
-            # 分组LR优化器
-            dec_ids=set(id(p) for p in model.decoder.parameters())
-            if not freeze_cb and abs(lr_cfg.get('codebook',1e-4)-lr_cfg.get('encoder',1e-4))>1e-10:
-                cb_ids=set(id(p) for p in list(model.codebook_hf.parameters())+list(model.codebook_mf.parameters()))
-                other=[p for p in model.parameters() if id(p) not in cb_ids and id(p) not in dec_ids]
-                opt=torch.optim.AdamW([
-                    {'params':other,'lr':lr_cfg['encoder']},
-                    {'params':list(model.codebook_hf.parameters())+list(model.codebook_mf.parameters()),'lr':lr_cfg['codebook']},
-                    {'params':model.decoder.parameters(),'lr':lr_cfg.get('decoder',lr_cfg['encoder'])},
-                ], weight_decay=1e-5)
-            else:
-                opt=torch.optim.AdamW(model.parameters(), lr=lr_cfg['encoder'], weight_decay=1e-5)
-
-            phase_eps=e-epoch+1; warmup_eps=min(5, phase_eps//4)
-            sch=torch.optim.lr_scheduler.SequentialLR(opt, [
-                torch.optim.lr_scheduler.LinearLR(opt, start_factor=0.1, total_iters=warmup_eps),
-                torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=phase_eps-warmup_eps),
-            ], milestones=[warmup_eps])
-            prev_stage=cur_stage
-
-        # 训练
-        model.train(); ep={'total':0,'img':0,'lap':0,'struct':0,'vq':0,'ssim':0}
-        opt.zero_grad()
-        for bi, batch in enumerate(tl):
-            projs=batch['projs'].to(device); ct=batch['ct'].to(device)
-            mask=batch.get('mask')
-            if mask is not None: mask=mask.to(device)
-            if projs.dim()!=5: projs=projs.unsqueeze(1) if projs.dim()==4 else projs
-
-            actual=projs.shape[1]; eff=min(cur_views, actual)
-            projs=subsample_projections(projs, eff, device) if eff<actual else projs[:,:actual]
-            projs_enc=add_angle_encoding(projs, projs.shape[1], device)
-
-            if args.amp:
-                with autocast():
-                    pred,vq,_=model(projs_enc)
-                    ct_a=nn.functional.interpolate(ct, size=pred.shape[2:], mode='trilinear')
-                    mask_a=nn.functional.interpolate(mask, size=pred.shape[2:], mode='nearest') if mask is not None else None
-                    loss=criterion(pred, ct_a, vq, mask_a)
-                scaler.scale(loss['total']/accum).backward()
-            else:
-                pred,vq,_=model(projs_enc)
-                ct_a=nn.functional.interpolate(ct, size=pred.shape[2:], mode='trilinear')
-                mask_a=nn.functional.interpolate(mask, size=pred.shape[2:], mode='nearest') if mask is not None else None
-                loss=criterion(pred, ct_a, vq, mask_a)
-                (loss['total']/accum).backward()
-
-            if (bi+1)%accum==0 or bi==len(tl)-1:
-                if args.amp:
-                    scaler.unscale_(opt); torch.nn.utils.clip_grad_norm_(model.parameters(),1.0)
-                    scaler.step(opt); scaler.update()
+            if (
+                (batch_index + 1) % accumulation_steps == 0
+                or batch_index == len(train_loader) - 1
+            ):
+                if use_amp:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
                 else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(),1.0); opt.step()
-                opt.zero_grad()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+                optimizer.zero_grad()
 
-            for k in ep: v=loss[k]; ep[k]+=(v.item() if isinstance(v,torch.Tensor) else v)
-        sch.step()
+            for name in epoch_sums:
+                epoch_sums[name] += float(losses[name].detach())
+            for name, value in model.codebook_diagnostics().items():
+                diagnostic_sums[name] = (
+                    diagnostic_sums.get(name, 0.0)
+                    + float(value.detach())
+                )
+        scheduler.step()
 
-        # 日志
-        nb=len(tl); avg={k:v/nb for k,v in ep.items()}; lr=opt.param_groups[0]['lr']
-        print(f'E{epoch:4d} S{cur_stage} lr={lr:.2e} V={cur_views} | '
-              f'total={avg["total"]:.4f} img={avg["img"]:.4f} lap={avg["lap"]:.4f} '
-              f'struct={avg["struct"]:.4f} vq={avg["vq"]:.4f}')
-        tag_map={'total':'总损失 Total Loss','img':'图像损失 Image',
-                 'lap':'拉普拉斯损失 Laplacian','struct':'结构损失 Structure',
-                 'vq':'码本损失 VQ','ssim':'SSIM'}
-        for k in avg: writer.add_scalar(f'Train/{tag_map.get(k,k)}',avg[k],epoch)
-        writer.add_scalar('Train/学习率 LR',lr,epoch)
-        writer.add_scalar('Train/视角数 n_views',cur_views,epoch)
-        writer.add_scalar('Train/阶段 Stage',cur_stage,epoch)
+        num_batches = len(train_loader)
+        averages = {
+            name: value / num_batches
+            for name, value in epoch_sums.items()
+        }
+        diagnostic_averages = {
+            name: value / num_batches
+            for name, value in diagnostic_sums.items()
+        }
+        learning_rates = {
+            group.get('name', f'group_{index}'): group['lr']
+            for index, group in enumerate(optimizer.param_groups)
+        }
+        print(
+            f'E{epoch:4d} S{current_stage} '
+            f'lr={next(iter(learning_rates.values())):.2e} '
+            f'V={current_views} | total={averages["total"]:.4f} '
+            f'img={averages["img"]:.4f} lap={averages["lap"]:.4f} '
+            f'struct={averages["struct"]:.4f} vq={averages["vq"]:.4f}'
+        )
+        for name, value in averages.items():
+            writer.add_scalar(f'Train/Loss/{name}', value, epoch)
+        weighted_total = sum(
+            averages[name]
+            for name in (
+                'weighted_img','weighted_lap',
+                'weighted_struct','weighted_vq',
+            )
+        )
+        if weighted_total > 0:
+            for name in (
+                'weighted_img','weighted_lap',
+                'weighted_struct','weighted_vq',
+            ):
+                writer.add_scalar(
+                    f'Train/LossContribution/{name}',
+                    averages[name] / weighted_total,
+                    epoch,
+                )
+        for name, value in learning_rates.items():
+            writer.add_scalar(f'Train/LearningRate/{name}', value, epoch)
+        for name, value in diagnostic_averages.items():
+            writer.add_scalar(f'Codebook/{name}', value, epoch)
+        writer.add_scalar('Train/n_views', current_views, epoch)
+        writer.add_scalar('Train/Stage', current_stage, epoch)
 
-        # 验证
-        if epoch%args.eval_every==0 or epoch==total_epochs:
-            em=evaluate(model, vl, device, criterion)
-            mask_ok = not np.isnan(float(em['psnr_mask']))
-            mstr=f' PSNR_mask={em["psnr_mask"]:.2f}dB MAE_mask={em["mae_mask"]:.4f}' if mask_ok else ''
-            print(f'  验证 | E{epoch} PSNR={em["psnr"]:.2f}dB{mstr} SSIM={em["ssim"]:.4f} img={em["img"]:.4f}')
-            etag={'psnr':'PSNR','psnr_mask':'PSNR (Mask)','mae_mask':'MAE (Mask)',
-                  'ssim':'SSIM','img':'图像损失 Image','lap':'拉普拉斯损失 Laplacian',
-                  'struct':'结构损失 Structure','total':'总损失 Total Loss'}
-            for k in em: writer.add_scalar(f'Eval/{etag.get(k,k)}',em[k],epoch)
+        validation_metrics = None
+        if epoch % args.eval_every == 0 or epoch == total_epochs:
+            validation_metrics = evaluate(
+                model, val_loader, device, criterion,
+                n_views=args.final_view, source_total=args.source_views,
+            )
+            mask_available = not np.isnan(
+                float(validation_metrics['psnr_mask'])
+            )
+            selection_metric = (
+                float(validation_metrics['psnr_mask'])
+                if mask_available else float(validation_metrics['psnr'])
+            )
+            print(
+                f'  Val | E{epoch} PSNR={validation_metrics["psnr"]:.2f}dB '
+                f'PSNR_mask={validation_metrics["psnr_mask"]:.2f}dB '
+                f'SSIM={validation_metrics["ssim"]:.4f} '
+                f'SSIM_mask={validation_metrics["ssim_mask"]:.4f}'
+            )
+            for name, value in validation_metrics.items():
+                writer.add_scalar(f'Val/{name}', value, epoch)
+            writer.add_scalar('Val/n_views', args.final_view, epoch)
 
-            cur_metric=float(em['psnr_mask']) if mask_ok else float(em['psnr'])
-            if cur_metric>best_mask_psnr:
-                best_mask_psnr=cur_metric; best_epoch=epoch
-                torch.save({'epoch':epoch,'model_state':model.state_dict(),
-                            'best_mask_psnr':best_mask_psnr,'stage':cur_stage,
-                            'views':cur_views,'eval_metrics':em},
-                           os.path.join(log_dir,'best_model.pth'))
-                print(f'  >> Best (Mask PSNR={best_mask_psnr:.2f}dB)')
+            if selection_metric > best_metric:
+                best_metric = selection_metric
+                best_epoch = epoch
+                payload = checkpoint_payload(
+                    epoch=epoch, model=model, optimizer=optimizer,
+                    scheduler=scheduler, scaler=scaler, args=args,
+                    run_name=run_name, stage=current_stage,
+                    current_train_views=current_views,
+                    resolved_views=resolved_views,
+                    best_metric=best_metric, best_epoch=best_epoch,
+                    eval_metrics=validation_metrics,
+                )
+                torch.save(
+                    payload, os.path.join(log_dir, best_checkpoint)
+                )
+                print(
+                    f'  >> Best validation checkpoint '
+                    f'(selection PSNR={best_metric:.2f}dB)'
+                )
 
-        if epoch%args.save_every==0:
-            torch.save({'epoch':epoch,'model_state':model.state_dict(),
-                        'best_mask_psnr':best_mask_psnr},
-                       os.path.join(log_dir,f'ckpt_{epoch:04d}.pth'))
+        if epoch % args.save_every == 0:
+            periodic_checkpoint = checkpoint_name(
+                'epoch', args.final_view, args.run_version, epoch
+            )
+            torch.save(
+                checkpoint_payload(
+                    epoch=epoch, model=model, optimizer=optimizer,
+                    scheduler=scheduler, scaler=scaler, args=args,
+                    run_name=run_name, stage=current_stage,
+                    current_train_views=current_views,
+                    resolved_views=resolved_views,
+                    best_metric=best_metric, best_epoch=best_epoch,
+                    eval_metrics=validation_metrics,
+                ),
+                os.path.join(log_dir, periodic_checkpoint),
+            )
+        last_epoch = epoch
+        last_stage = current_stage
+        last_views = current_views
 
+    if optimizer is not None:
+        torch.save(
+            checkpoint_payload(
+                epoch=last_epoch, model=model, optimizer=optimizer,
+                scheduler=scheduler, scaler=scaler, args=args,
+                run_name=run_name, stage=last_stage,
+                current_train_views=last_views,
+                resolved_views=resolved_views,
+                best_metric=best_metric, best_epoch=best_epoch,
+            ),
+            os.path.join(log_dir, last_checkpoint),
+        )
+
+    best_path = os.path.join(log_dir, best_checkpoint)
+    if not os.path.isfile(best_path):
+        if (
+            args.resume
+            and int(resume_checkpoint.get('epoch', -1)) == best_epoch
+        ):
+            best_path = args.resume
+        else:
+            raise FileNotFoundError(
+                'Best validation checkpoint is missing; cannot perform the '
+                'held-out test evaluation.'
+            )
+    best_payload = load_training_checkpoint(best_path, device)
+    model.load_state_dict(best_payload['model_state'])
+    best_loss_weights = get_stage_config(
+        int(best_payload.get('stage', 3))
+    )[0]
+    criterion.set_weights(**best_loss_weights)
+    test_metrics = evaluate(
+        model, test_loader, device, criterion, n_views=args.final_view,
+        source_total=args.source_views,
+    )
+    for name, value in test_metrics.items():
+        writer.add_scalar(f'Test/{name}', value, total_epochs)
+    writer.add_scalar('Test/n_views', args.final_view, total_epochs)
+    with open(os.path.join(log_dir, 'test_metrics.json'), 'w') as handle:
+        json.dump({
+            'checkpoint': os.path.abspath(best_path),
+            'best_val_epoch': best_epoch,
+            'final_view': args.final_view,
+            'metrics': test_metrics,
+        }, handle, indent=2)
     writer.close()
-    print(f'\nDone. Best Mask PSNR: {best_mask_psnr:.2f}dB at epoch {best_epoch} | {log_dir}')
+    print(
+        f'\nDone. Best validation PSNR: {best_metric:.2f}dB at epoch '
+        f'{best_epoch}. Held-out test evaluated once at {args.final_view} views.'
+    )
 
 
 # =========================================================================
@@ -346,28 +1005,40 @@ def train(args):
 # =========================================================================
 
 if __name__=='__main__':
-    p=argparse.ArgumentParser(description='SparseViewReconstruction v4')
+    p=argparse.ArgumentParser(description='SparseViewReconstruction training')
     p.add_argument('--data_root', type=str, required=True)
     p.add_argument('--vol_size', type=int, nargs=3, default=(128,128,128))
     p.add_argument('--organ', type=str, default='thorax_fast')
-    p.add_argument('--train_views', type=int, default=6)
-    p.add_argument('--stage1_epochs', type=int, default=200, help='阶段1: 64-view 预训练轮数')
-    p.add_argument('--stage1_views', type=int, default=64)
-    p.add_argument('--stage2_view_decay', type=str, default='8,4,2',
-                   help='阶段2 视角衰减: "8,4,2"=步长模式(从stage1_views递减到train_views), 也可显式列表如"56,48,..."')
+    p.add_argument('--run_version', type=str, required=True,
+                   help='Unique run version such as v3; existing non-empty runs are rejected')
+    p.add_argument('--final_view', type=int, choices=(6,8,10), default=6,
+                   help='Final deployment/evaluation view count')
+    p.add_argument('--view_schedule', type=str, default=None,
+                   help='Optional full high-to-low override, e.g. "60,48,24,12,6"')
+    p.add_argument('--source_views', type=int, default=491,
+                   help='Expected number of projections in the original 360-degree grid')
+    p.add_argument('--stage1_epochs', type=int, default=200,
+                   help='Stage 1 epochs at the curriculum maximum with EMA updates enabled')
     p.add_argument('--stage2_epochs_per_view', type=int, default=40, help='阶段2 每个视角的训练轮数')
-    p.add_argument('--stage3_epochs', type=int, default=100, help='阶段3: 6-view 冻结码本微调')
+    p.add_argument('--stage3_epochs', type=int, default=100,
+                   help='Stage 3 epochs at final_view with quantizer frozen')
     p.add_argument('--proj_size', type=int, nargs=2, default=(128,128))
     p.add_argument('--n_decoder_ups', type=int, default=1)
-    p.add_argument('--epochs', type=int, default=600)
+    p.add_argument(
+        '--transformer_layers', type=int, default=4,
+        help='Number of cross-view TransformerEncoderLayer blocks',
+    )
     p.add_argument('--batch_size', type=int, default=1)
     p.add_argument('--grad_accum', type=int, default=4)
-    p.add_argument('--lr', type=float, default=1e-4)
     p.add_argument('--num_workers', type=int, default=2)
     p.add_argument('--amp', action='store_true', default=True)
     p.add_argument('--no_amp', action='store_false', dest='amp')
     p.add_argument('--log_dir', type=str, default='./logs')
     p.add_argument('--eval_every', type=int, default=10)
     p.add_argument('--save_every', type=int, default=50)
+    p.add_argument('--ct_range', type=float, nargs=2, default=(-1000.0,1000.0),
+                   help='HU range represented by normalized CT labels [0,1]')
+    p.add_argument('--resume', type=str, default=None,
+                   help='Resume from a full best/periodic/last checkpoint')
     args=p.parse_args()
     train(args)
