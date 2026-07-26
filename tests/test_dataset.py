@@ -26,6 +26,7 @@ from src.train import (
     build_view_schedule,
     checkpoint_payload,
     checkpoint_name,
+    collate_variable_projection_batch,
     evaluate,
     get_stage_config,
     subsample_projections,
@@ -304,7 +305,8 @@ class LossAndGeometryTest(unittest.TestCase):
         optimizer = torch.optim.AdamW(model.parameters())
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
         args = Namespace(
-            run_version='v3', final_view=6, source_views=491,
+            run_version='v3', final_view=6,
+            source_view_range=(464,491),
             n_decoder_ups=1, transformer_layers=4, proj_size=(128,128),
             vol_size=(128,128,128), ct_range=(-1000.0,1000.0),
             stage1_epochs=200,stage2_epochs_per_view=40,
@@ -325,6 +327,9 @@ class LossAndGeometryTest(unittest.TestCase):
         ):
             self.assertIn(key, payload)
         self.assertEqual(payload['model_config']['transformer_layers'], 4)
+        self.assertEqual(payload['checkpoint_format'], 4)
+        self.assertEqual(payload['source_view_policy'], 'per_case_actual')
+        self.assertEqual(payload['source_view_range'], [464,491])
         self.assertIs(validate_checkpoint_metadata(payload), payload)
 
     def test_legacy_checkpoint_is_rejected(self):
@@ -333,6 +338,72 @@ class LossAndGeometryTest(unittest.TestCase):
 
 
 class ThoraxDatasetTest(unittest.TestCase):
+    def test_mixed_source_counts_batch_and_sample_per_case(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            proj_dir = os.path.join(tmpdir, 'projections')
+            ct_dir = os.path.join(tmpdir, 'images', 'ct')
+            os.makedirs(proj_dir)
+            os.makedirs(ct_dir)
+            cases = {'case491': 491, 'case464': 464}
+            for case_id, total in cases.items():
+                with open(
+                    os.path.join(proj_dir, f'{case_id}.pickle'), 'wb'
+                ) as handle:
+                    pickle.dump({
+                        'projs': np.zeros((total,2,2), dtype=np.uint8),
+                        'angles': np.linspace(
+                            0,2*np.pi,total,endpoint=False
+                        ).astype(np.float32),
+                        'projs_max': 0.2,
+                    }, handle)
+                Path(os.path.join(ct_dir, f'{case_id}.nii.gz')).touch()
+            with open(os.path.join(tmpdir, 'splits.json'), 'w') as handle:
+                json.dump({
+                    'train': list(cases),
+                    'val': list(cases),
+                    'test': list(cases),
+                }, handle)
+            with patch.object(
+                ThoraxCTDataset, '_load_ct',
+                return_value=np.zeros((2,2,2), dtype=np.float32),
+            ):
+                dataset = ThoraxCTDataset(
+                    data_root=tmpdir, split='train', n_views=-1,
+                    proj_size=(2,2), vol_size=(2,2,2),
+                )
+                batch = next(iter(torch.utils.data.DataLoader(
+                    dataset, batch_size=2, shuffle=False,
+                    collate_fn=collate_variable_projection_batch,
+                )))
+
+            self.assertEqual(
+                [len(item) for item in batch['projs']], [491,464]
+            )
+            encoded_indices = [
+                item.float().view(-1,1,1,1)
+                for item in batch['view_indices']
+            ]
+            sampled, sampled_angles = subsample_projections(
+                encoded_indices, 6, torch.device('cpu'), batch['angles'],
+                source_total=batch['source_views'],
+                view_indices=batch['view_indices'],
+            )
+            for sample_index, total in enumerate(batch['source_views']):
+                expected = uniform_view_indices(
+                    int(total),6,torch.device('cpu')
+                )
+                self.assertTrue(torch.equal(
+                    sampled[sample_index,:,0,0,0].long(), expected
+                ))
+                expected_angles = (
+                    expected.float() * (2 * torch.pi / int(total))
+                )
+                self.assertTrue(torch.allclose(
+                    sampled_angles[sample_index],
+                    expected_angles,
+                    atol=1e-6,
+                ))
+
     def test_dataset_uses_fixed_uniform_indices_and_returns_angles(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             proj_dir = os.path.join(tmpdir, 'projections')
@@ -385,7 +456,7 @@ class ThoraxDatasetTest(unittest.TestCase):
                 torch.allclose(sample['angles'], torch.from_numpy(angles[expected]))
             )
 
-    def test_dataset_union_contains_each_direct_source_protocol(self):
+    def test_full_source_contains_each_direct_source_protocol(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             proj_dir = os.path.join(tmpdir, 'projections')
             ct_dir = os.path.join(tmpdir, 'images', 'ct')
@@ -413,11 +484,11 @@ class ThoraxDatasetTest(unittest.TestCase):
             ):
                 dataset = ThoraxCTDataset(
                     data_root=tmpdir,split='train',n_views=-1,
-                    view_counts=(60,54,48,36,24,12,6),
                     expected_source_views=491,
                     proj_size=(2,2),vol_size=(2,2,2),
                 )
                 sample = dataset[0]
+            self.assertEqual(len(sample['view_indices']), 491)
             loaded = set(sample['view_indices'].tolist())
             for count in (60,54,48,36,24,12,6):
                 target = uniform_view_indices(

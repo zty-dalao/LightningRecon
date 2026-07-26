@@ -44,13 +44,14 @@ def add_angle_encoding(projs, angles, device):
 
 def validate_checkpoint_metadata(checkpoint):
     """Reject legacy checkpoints that cannot reproduce preprocessing safely."""
-    if int(checkpoint.get('checkpoint_format', 0)) != 3:
+    if int(checkpoint.get('checkpoint_format', 0)) != 4:
         raise ValueError(
-            'Unsupported legacy checkpoint. Expected checkpoint_format=3 '
-            'with source-grid, model, and HU metadata.'
+            'Unsupported legacy checkpoint. Expected checkpoint_format=4 '
+            'with per-case source-grid, model, and HU metadata.'
         )
     required = (
-        'model_state','model_config','ct_normalization','source_views',
+        'model_state','model_config','ct_normalization',
+        'source_view_policy','source_view_range',
         'eval_views','final_view','run_version',
     )
     missing = [key for key in required if key not in checkpoint]
@@ -63,7 +64,7 @@ def validate_checkpoint_metadata(checkpoint):
 
 def load_model(checkpoint_path, device, n_decoder_ups=None,
                transformer_layers=None,
-               expected_views=None, expected_source_views=None,
+               expected_views=None,
                checkpoint_data=None):
     ckpt = (
         checkpoint_data
@@ -73,8 +74,7 @@ def load_model(checkpoint_path, device, n_decoder_ups=None,
     validate_checkpoint_metadata(ckpt)
     model_config = ckpt['model_config']
     saved_ups = int(model_config['n_decoder_ups'])
-    # Early format-3 checkpoints predate this field and used two layers.
-    saved_transformer_layers = int(model_config.get('transformer_layers', 2))
+    saved_transformer_layers = int(model_config['transformer_layers'])
     if n_decoder_ups is not None and int(n_decoder_ups) != saved_ups:
         raise ValueError(
             f'n_decoder_ups={n_decoder_ups} does not match checkpoint '
@@ -96,7 +96,7 @@ def load_model(checkpoint_path, device, n_decoder_ups=None,
     model.eval()
     metric=ckpt.get('best_mask_psnr','N/A')
     eval_views=ckpt['eval_views']
-    source_views=ckpt['source_views']
+    source_view_range=ckpt['source_view_range']
     run_version=ckpt['run_version']
     if expected_views is not None:
         if int(eval_views) != int(expected_views):
@@ -104,16 +104,11 @@ def load_model(checkpoint_path, device, n_decoder_ups=None,
                 f'Checkpoint was selected at {eval_views} views, '
                 f'but inference requested {expected_views}'
             )
-    if expected_source_views is not None:
-        if int(source_views) != int(expected_source_views):
-            raise ValueError(
-                f'Checkpoint uses a {source_views}-view source grid, '
-                f'but inference requested {expected_source_views}'
-            )
     print(
         f'Loaded epoch {ckpt.get("epoch","?")}, '
         f'Mask PSNR={metric}, eval_views={eval_views}, '
-        f'source_views={source_views}, run_version={run_version}, '
+        f'per-case source views={source_view_range}, '
+        f'run_version={run_version}, '
         f'transformer_layers={saved_transformer_layers}'
     )
     return model,ckpt
@@ -130,16 +125,19 @@ def reconstruct_single(model, dataset, case_id, device, n_views=6,
     batch = dataset[idx]
     source_projs = batch['projs'][:, 0, :, :]
     source_angles = batch['angles']
+    source_views = int(batch['source_views'])
     expected_indices = uniform_view_indices(
-        dataset.max_views,n_views,batch['view_indices'].device
+        source_views,n_views,batch['view_indices'].device
     )
-    if not torch.equal(batch['view_indices'],expected_indices):
+    matches = batch['view_indices'][:, None].eq(expected_indices[None, :])
+    if not torch.all(matches.sum(dim=0) == 1):
         raise ValueError(
             f'Case {case_id!r} does not contain the expected direct '
-            f'{dataset.max_views}->{n_views} source-grid protocol'
+            f'{source_views}->{n_views} source-grid protocol'
         )
-    projs = source_projs
-    angles = source_angles
+    positions = matches.to(torch.int64).argmax(dim=0)
+    projs = source_projs.index_select(0, positions)
+    angles = source_angles.index_select(0, positions)
     projs_enc = add_angle_encoding(projs.to(device),angles,device)   # (V, 3, H, W)
     projs_enc = projs_enc.unsqueeze(0)                               # (1, V, 3, H, W)
 
@@ -192,6 +190,8 @@ def save_nifti(volume, path, reference_path):
 
 def inference(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if args.source_views == 0 or args.source_views < -1:
+        raise ValueError('source_views must be -1 or a positive integer')
     resolve_view_curriculum(
         args.final_view,args.view_schedule,max_views=64
     )
@@ -199,12 +199,6 @@ def inference(args):
     checkpoint_preview=validate_checkpoint_metadata(
         torch.load(args.checkpoint,map_location='cpu')
     )
-    source_views=int(checkpoint_preview['source_views'])
-    if args.source_views is not None and args.source_views != source_views:
-        raise ValueError(
-            f'--source_views={args.source_views} does not match checkpoint '
-            f'source_views={source_views}'
-        )
     model_config=checkpoint_preview['model_config']
     saved_proj_size=tuple(model_config['proj_size'])
     saved_vol_size=tuple(model_config['vol_size'])
@@ -222,19 +216,22 @@ def inference(args):
         args.checkpoint,device,n_decoder_ups=args.n_decoder_ups,
         transformer_layers=args.transformer_layers,
         expected_views=n_views,
-        expected_source_views=source_views,
         checkpoint_data=checkpoint_preview,
     )
     dataset = ThoraxCTDataset(data_root=args.data_root,
                              split=args.split if args.case_id is None else 'test',
                              n_views=-1,
-                             view_counts=(n_views,),
                              proj_size=saved_proj_size,
                              vol_size=saved_vol_size,
-                             expected_source_views=source_views)
+                             expected_source_views=(
+                                 None
+                                 if args.source_views == -1
+                                 else args.source_views
+                             ))
     print(
         f'Dataset: {len(dataset)} cases, '
-        f'{source_views}-view source grid -> {n_views}-view inference'
+        f'per-case source views={dataset.min_views}..{dataset.max_views} '
+        f'-> {n_views}-view inference'
     )
 
     if args.case_id:
@@ -265,7 +262,11 @@ if __name__ == '__main__':
     p.add_argument('--final_view', type=int, choices=(6,8,10), default=6)
     p.add_argument('--view_schedule', type=str, default=None,
                    help='Optional protocol validation; final_view controls inference')
-    p.add_argument('--source_views', type=int, default=None)
+    p.add_argument(
+        '--source_views', type=int, default=-1,
+        help='-1 loads each case in full; a positive value optionally asserts '
+             'an identical source-view count',
+    )
     p.add_argument('--proj_size', type=int, nargs=2, default=None)
     p.add_argument('--n_decoder_ups', type=int, default=None)
     p.add_argument(

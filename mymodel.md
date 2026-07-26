@@ -17,7 +17,7 @@ graph TD
     classDef data fill:#fff9c4,stroke:#f57f17,stroke-width:2px;
     classDef frozen fill:#ffcdd2,stroke:#c62828,stroke-width:2px,stroke-dasharray: 5 5;
 
-    subgraph Stage1 [阶段一：码本预训练（原始491中直采60/64 views）]
+    subgraph Stage1 [阶段一：码本预训练（各病例原始网格中直采60/64 views）]
         direction TB
         P1["固定等间隔 60/64 张投影 + 真实角度编码"]:::data --> P2["2D CNN + 4层跨视角 Transformer"]:::module
         P2 --> P3["2D→3D 可微分反投影"]:::module
@@ -104,8 +104,12 @@ CNN 特征做残差相加。
 
 可用 `--view_schedule` 提供完整高到低序列覆盖内置映射；覆盖序列仍须保持最终视角角度锚定。
 
-每一级视角都直接按照 `floor(k×491/n_views)` 从原始 491-view
-全旋转网格选择，不经过 60/64-view 二次下采样。训练集用于更新参数，
+对每个病例，先读取其实际原始视角数 `V_case`（可以是491、464或其他值），
+数据集以 `--source_views -1` 加载该病例的全部投影，再按
+`floor(k×V_case/n_views)` 从该病例自己的全旋转网格直接选择每一级视角，
+不经过60/64-view二次下采样。不同病例只要求实际视角数不少于课程最大
+视角数，不要求原始总数一致。变长全视角数据在 batch 中保持为列表，
+采样成相同的阶段视角数之后才堆叠，不做补零填充。训练集用于更新参数，
 验证集用于选择 best checkpoint，测试集只在训练结束后对 best checkpoint
 评估一次。
 
@@ -234,7 +238,7 @@ class EmbeddingEMA:
 | `--final_view` | 6 | 最终训练、验证和推理视角；可选6/8/10 |
 | `--view_schedule` | 空 | 可选完整覆盖序列，如`"60,48,36,24,12,6"` |
 | `--run_version` | 必填 | 唯一运行版本，如`v3`；已有非空版本目录不会被覆盖 |
-| `--source_views` | 491 | 原始360°投影网格数量；所有阶段从该网格直接采样 |
+| `--source_views` | -1 | 加载每个病例的全部视角并自适应；正整数仅作为所有病例原始视角数一致的可选断言 |
 | `--resume` | 空 | 从 best、periodic 或 last checkpoint 完整恢复 |
 | `--stage2_epochs_per_view` | 40 | 阶段二每个视角级训练轮数 |
 | `--stage3_epochs` | 100 | 阶段三目标视角微调轮数 |
@@ -277,7 +281,7 @@ cd /root/autodl-tmp/LightningRecon
 python src/train.py \
     --data_root /root/autodl-tmp/thorax \
     --vol_size 128 128 128 --proj_size 128 128 \
-    --final_view 6 --run_version v3 \
+    --final_view 6 --source_views -1 --run_version v3 \
     --stage1_epochs 200 --stage2_epochs_per_view 40 \
     --stage3_epochs 100 \
     --n_decoder_ups 1 --grad_accum 8 --batch_size 1 --num_workers 2
@@ -288,7 +292,7 @@ python src/train.py \
 python src/train.py \
     --data_root /root/autodl-tmp/thorax \
     --vol_size 128 128 128 --proj_size 128 128 \
-    --final_view 6 --run_version v3 \
+    --final_view 6 --source_views -1 --run_version v3 \
     --stage1_epochs 200 --stage2_epochs_per_view 40 \
     --stage3_epochs 100 \
     --n_decoder_ups 2 --grad_accum 8 --batch_size 1 --num_workers 2
@@ -299,7 +303,7 @@ python src/train.py \
 python src/train.py \
     --data_root /root/autodl-tmp/thorax \
     --vol_size 128 128 128 --proj_size 128 128 \
-    --final_view 6 --run_version v3 --stage1_epochs 10 \
+    --final_view 6 --source_views -1 --run_version v3 --stage1_epochs 10 \
     --stage2_epochs_per_view 1 --stage3_epochs 0 \
     --n_decoder_ups 1 --grad_accum 2 --batch_size 1 --num_workers 0
 
@@ -309,7 +313,7 @@ python src/train.py \
 python src/train.py \
     --data_root /root/autodl-tmp/thorax \
     --vol_size 128 128 128 --proj_size 128 128 \
-    --final_view 6 --run_version v3 --stage1_epochs 1 \
+    --final_view 6 --source_views -1 --run_version v3 --stage1_epochs 1 \
     --stage2_epochs_per_view 1 \
     --stage3_epochs 1 \
     --n_decoder_ups 1 --grad_accum 2 --batch_size 1 --num_workers 0
@@ -319,7 +323,8 @@ python src/train.py \
 # ═══════════════════════════════════════════════════════════════
 python src/inference.py \
     --checkpoint 'logs/thorax_fast_finalview=6_256_v3/best_model_finalview=6_v3.pth' \
-    --data_root /root/autodl-tmp/thorax --case_id CASE_ID --final_view 6
+    --data_root /root/autodl-tmp/thorax --case_id CASE_ID \
+    --final_view 6 --source_views -1
 
 # TensorBoard
 tensorboard --logdir 'logs/thorax_fast_finalview=6_256_v3/tensorboard'

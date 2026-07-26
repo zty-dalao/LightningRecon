@@ -8,7 +8,7 @@
 核心改动:
   - L_img (Charbonnier, mask 内) 为主损失 (w=1.0)
   - 投影与真实物理角度始终绑定
-  - 每个阶段直接从原始 source_views 网格等间隔采样
+  - 每个阶段直接从每个病例自己的原始视角网格等间隔采样
   - val 始终使用 --final_view 选择 checkpoint；test 仅在结束时评估
   - best/periodic/last checkpoint 均可完整恢复训练
   - Warmup + CosineAnnealingLR, 每阶段重置
@@ -23,6 +23,7 @@ import os, sys, argparse, json, re, random
 import numpy as np
 import torch, torch.nn as nn
 from torch.utils.data import DataLoader
+from torch.utils.data._utils.collate import default_collate
 from torch.utils.tensorboard import SummaryWriter
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -91,46 +92,125 @@ def uniform_view_indices(total_views, n_keep, device):
     return torch.tensor(indices,device=device,dtype=torch.long)
 
 
+def collate_variable_projection_batch(samples):
+    """Keep full projection sequences as lists; collate fixed-size fields."""
+    variable_keys = {'projs', 'angles', 'view_indices'}
+    batch = {
+        key: [sample[key] for sample in samples]
+        for key in variable_keys
+    }
+    for key in samples[0]:
+        if key not in variable_keys:
+            batch[key] = default_collate([sample[key] for sample in samples])
+    return batch
+
+
 def subsample_projections(
     projs, n_keep, device, angles=None, *,
     source_total=None, view_indices=None,
 ):
-    """Select a direct source-grid protocol and keep projections/angles paired."""
+    """Select each case's direct source-grid protocol with paired angles."""
+    if isinstance(projs, (list, tuple)):
+        if angles is not None and not isinstance(angles, (list, tuple)):
+            raise ValueError('Variable projection batches require angle lists')
+        if view_indices is not None and not isinstance(
+            view_indices, (list, tuple)
+        ):
+            raise ValueError(
+                'Variable projection batches require view-index lists'
+            )
+        if isinstance(source_total, torch.Tensor):
+            totals = source_total.detach().view(-1).tolist()
+        elif isinstance(source_total, (tuple, list)):
+            totals = list(source_total)
+        else:
+            totals = [source_total] * len(projs)
+        if len(totals) != len(projs):
+            raise ValueError(
+                f'Expected {len(projs)} source totals, got {len(totals)}'
+            )
+        selected_projs = []
+        selected_angles = []
+        for sample_index, sample_projs in enumerate(projs):
+            result = subsample_projections(
+                sample_projs.unsqueeze(0),
+                n_keep,
+                device,
+                None if angles is None else angles[sample_index].unsqueeze(0),
+                source_total=totals[sample_index],
+                view_indices=(
+                    None
+                    if view_indices is None
+                    else view_indices[sample_index].unsqueeze(0)
+                ),
+            )
+            if angles is None:
+                selected_projs.append(result[0])
+            else:
+                sample_selected, sample_angles = result
+                selected_projs.append(sample_selected[0])
+                selected_angles.append(sample_angles[0])
+        projs_out = torch.stack(selected_projs).contiguous()
+        if angles is None:
+            return projs_out
+        return projs_out, torch.stack(selected_angles).contiguous()
+
     if projs.dim() != 5:
         raise ValueError(f'Expected 5D, got {tuple(projs.shape)}')
     V_total = projs.shape[1]
     if view_indices is None:
         idx = uniform_view_indices(V_total, n_keep, device)
+        sampled_projs = projs.index_select(1, idx).contiguous()
+        if angles is None:
+            return sampled_projs
+        return sampled_projs, angles.index_select(1, idx).contiguous()
+
+    if source_total is None:
+        raise ValueError('source_total is required with view_indices')
+    if view_indices.dim() == 1:
+        view_indices = view_indices.unsqueeze(0)
+    if view_indices.dim() != 2 or view_indices.shape != projs.shape[:2]:
+        raise ValueError(
+            f'Expected view_indices shape {tuple(projs.shape[:2])}, got '
+            f'{tuple(view_indices.shape)}'
+        )
+    if isinstance(source_total, torch.Tensor):
+        totals = source_total.detach().view(-1).tolist()
+    elif isinstance(source_total, (tuple, list)):
+        totals = list(source_total)
     else:
-        if source_total is None:
-            raise ValueError('source_total is required with view_indices')
-        if view_indices.dim() == 1:
-            available = view_indices
-        elif view_indices.dim() == 2:
-            if not torch.equal(
-                view_indices, view_indices[0].expand_as(view_indices)
-            ):
-                raise ValueError('Batch cases do not share the same source grid')
-            available = view_indices[0]
-        else:
-            raise ValueError(
-                f'Expected 1D/2D view_indices, got {tuple(view_indices.shape)}'
-            )
-        available = available.to(device)
-        target = uniform_view_indices(source_total, n_keep, device)
+        totals = [source_total] * projs.shape[0]
+    if len(totals) != projs.shape[0]:
+        raise ValueError(
+            f'Expected {projs.shape[0]} source totals, got {len(totals)}'
+        )
+
+    sampled_projs = []
+    sampled_angles = []
+    for sample_index, total in enumerate(totals):
+        total = int(total)
+        available = view_indices[sample_index].to(device)
+        target = uniform_view_indices(total, n_keep, device)
         matches = available[:, None].eq(target[None, :])
         if not torch.all(matches.sum(dim=0) == 1):
             missing = target[matches.sum(dim=0) != 1].tolist()
             raise ValueError(
-                f'Loaded projection union does not contain the direct '
-                f'{source_total}->{n_keep} protocol; missing indices={missing}'
+                f'Batch sample {sample_index}: loaded projection union does '
+                f'not contain the direct {total}->{n_keep} protocol; '
+                f'missing indices={missing}'
             )
-        idx = matches.to(torch.int64).argmax(dim=0)
-    sampled_projs = projs.index_select(1, idx).contiguous()
+        positions = matches.to(torch.int64).argmax(dim=0)
+        sampled_projs.append(
+            projs[sample_index].index_select(0, positions)
+        )
+        if angles is not None:
+            sampled_angles.append(
+                angles[sample_index].index_select(0, positions)
+            )
+    projs_out = torch.stack(sampled_projs).contiguous()
     if angles is None:
-        return sampled_projs
-    sampled_angles = angles.index_select(1, idx).contiguous()
-    return sampled_projs, sampled_angles
+        return projs_out
+    return projs_out, torch.stack(sampled_angles).contiguous()
 
 
 def _psnr(p, t, mask=None):
@@ -317,7 +397,7 @@ def checkpoint_payload(
 ):
     """Build a fully resumable, self-describing training checkpoint."""
     return {
-        'checkpoint_format': 3,
+        'checkpoint_format': 4,
         'epoch': epoch,
         'model_state': model.state_dict(),
         'optimizer_state': optimizer.state_dict(),
@@ -332,9 +412,10 @@ def checkpoint_payload(
         'stage': stage,
         'current_train_views': current_train_views,
         'eval_views': args.final_view,
-        'source_views': args.source_views,
+        'source_view_policy': 'per_case_actual',
+        'source_view_range': list(args.source_view_range),
         'resolved_view_schedule': resolved_views,
-        'sampling_protocol': 'direct_uniform_from_source_grid',
+        'sampling_protocol': 'load_all_then_direct_uniform_per_case',
         'model_config': {
             'n_decoder_ups': args.n_decoder_ups,
             'transformer_layers': args.transformer_layers,
@@ -376,31 +457,28 @@ def evaluate(model, loader, device, criterion, n_views, source_total=None):
          'total':0,'img':0,'lap':0,'struct':0,'perplexity':0,
          'c':0,'c_mask':0,'c_ssim_mask':0}
     for batch in loader:
-        projs=batch['projs'].to(device); ct=batch['ct'].to(device)
-        angles=batch['angles'].to(device)
+        source_projs=batch['projs']
+        source_angles=batch['angles']
+        ct=batch['ct'].to(device)
         view_indices=batch.get('view_indices')
-        if view_indices is not None:
-            view_indices=view_indices.to(device)
+        case_source_totals = batch.get('source_views', source_total)
         mask=batch.get('mask')
         if mask is not None: mask=mask.to(device)
         mask_available=batch.get('mask_available')
         if mask_available is None:
             mask_available=torch.full(
-                (projs.shape[0],),mask is not None,
+                (ct.shape[0],),mask is not None,
                 dtype=torch.bool,device=device,
             )
         else:
             mask_available=mask_available.to(device).bool()
-        if projs.shape[1] < n_views:
-            raise ValueError(
-                f'Validation sample has {projs.shape[1]} views, '
-                f'but {n_views} were requested'
-            )
         projs,angles=subsample_projections(
-            projs,n_views,device,angles,
-            source_total=source_total,
+            source_projs,n_views,torch.device('cpu'),source_angles,
+            source_total=case_source_totals,
             view_indices=view_indices,
         )
+        projs=projs.to(device)
+        angles=angles.to(device)
         projs_enc=add_angle_encoding(projs,angles)
         pred,vq,perplexity=model(projs_enc)
         ct_a=nn.functional.interpolate(ct, size=pred.shape[2:], mode='trilinear')
@@ -461,13 +539,10 @@ def train(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     view_schedule = build_view_schedule(args)
     resolved_views = [nv for _, _, nv, stage in view_schedule if stage != 3]
-    if args.source_views < max(resolved_views):
-        raise ValueError(
-            f'source_views={args.source_views} is smaller than curriculum '
-            f'maximum {max(resolved_views)}'
-        )
     if args.eval_every <= 0 or args.save_every <= 0:
         raise ValueError('eval_every and save_every must be positive')
+    if args.source_views == 0 or args.source_views < -1:
+        raise ValueError('source_views must be -1 or a positive integer')
     if args.transformer_layers <= 0:
         raise ValueError('transformer_layers must be positive')
     if args.ct_range[0] >= args.ct_range[1]:
@@ -482,15 +557,14 @@ def train(args):
     resume_checkpoint = None
     if args.resume:
         resume_checkpoint = load_training_checkpoint(args.resume, device)
-        if int(resume_checkpoint.get('checkpoint_format', 0)) != 3:
+        if int(resume_checkpoint.get('checkpoint_format', 0)) != 4:
             raise ValueError(
-                'This checkpoint is not compatible with checkpoint_format=3. '
+                'This checkpoint is not compatible with checkpoint_format=4. '
                 'Start a new training run with the cleaned model definition.'
             )
         for key, expected in (
             ('run_version', args.run_version),
             ('final_view', args.final_view),
-            ('source_views', args.source_views),
         ):
             actual = resume_checkpoint.get(key)
             if actual is not None and actual != expected:
@@ -554,43 +628,64 @@ def train(args):
         'n_views': -1,
         'proj_size': tuple(args.proj_size),
         'vol_size': tuple(args.vol_size),
-        'expected_source_views': args.source_views,
+        'expected_source_views': (
+            None if args.source_views == -1 else args.source_views
+        ),
     }
-    train_set = ThoraxCTDataset(
-        split='train', view_counts=resolved_views, **dataset_kwargs
+    train_set = ThoraxCTDataset(split='train', **dataset_kwargs)
+    val_set = ThoraxCTDataset(split='val', **dataset_kwargs)
+    test_set = ThoraxCTDataset(split='test', **dataset_kwargs)
+    all_source_counts = {
+        **train_set.source_view_counts,
+        **val_set.source_view_counts,
+        **test_set.source_view_counts,
+    }
+    args.source_view_range = (
+        min(all_source_counts.values()),
+        max(all_source_counts.values()),
     )
-    val_set = ThoraxCTDataset(
-        split='val', view_counts=(args.final_view,), **dataset_kwargs
-    )
-    test_set = ThoraxCTDataset(
-        split='test', view_counts=(args.final_view,), **dataset_kwargs
-    )
+    if args.source_view_range[0] < max(resolved_views):
+        raise ValueError(
+            f'At least one case has only {args.source_view_range[0]} source '
+            f'views, below curriculum maximum {max(resolved_views)}'
+        )
+    if resume_checkpoint is not None:
+        saved_policy = resume_checkpoint.get('source_view_policy')
+        saved_range = resume_checkpoint.get('source_view_range')
+        if saved_policy != 'per_case_actual':
+            raise ValueError(
+                f'Resume source-view policy is incompatible: {saved_policy!r}'
+            )
+        if saved_range != list(args.source_view_range):
+            raise ValueError(
+                f'Resume source-view range differs from the current dataset: '
+                f'{saved_range} vs {list(args.source_view_range)}'
+            )
     pin_memory = device.type == 'cuda'
     train_loader = DataLoader(
         train_set, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, pin_memory=pin_memory,
+        collate_fn=collate_variable_projection_batch,
     )
     val_loader = DataLoader(
         val_set, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, pin_memory=pin_memory,
+        collate_fn=collate_variable_projection_batch,
     )
     test_loader = DataLoader(
         test_set, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, pin_memory=pin_memory,
+        collate_fn=collate_variable_projection_batch,
     )
     print(
         f'Train:{len(train_set)} Val:{len(val_set)} Test:{len(test_set)} | '
-        f'source grid={args.source_views}'
+        f'per-case source views={args.source_view_range[0]}..'
+        f'{args.source_view_range[1]}'
     )
-    train_union_size = len({
-        index
-        for count in resolved_views
-        for index in protocol_view_indices(args.source_views, count)
-    })
     print(
-        f'Protocol: every phase samples directly from the '
-        f'{args.source_views}-view source grid; loaded train union='
-        f'{train_union_size} views; val/test={args.final_view} views'
+        f'Protocol: load every case-specific source grid in full, then sample '
+        f'each phase directly to its requested view count; '
+        f'val/test={args.final_view} views'
     )
     print(f'View schedule ({len(view_schedule)} phases, {total_epochs} epochs):')
     for start, end, n_views, stage in view_schedule:
@@ -644,8 +739,9 @@ def train(args):
         '\n'.join([
             f'- run_name: `{run_name}`',
             f'- run_version: `{args.run_version}`',
-            f'- source_views: `{args.source_views}`',
-            f'- loaded_train_view_union: `{train_union_size}`',
+            f'- source_view_policy: `per_case_actual`',
+            f'- source_view_range: `{args.source_view_range}`',
+            f'- projection_loading: `all_views_per_case`',
             f'- final_view: `{args.final_view}`',
             f'- transformer_layers: `{args.transformer_layers}`',
             f'- resolved_view_schedule: `{resolved_views}`',
@@ -663,8 +759,10 @@ def train(args):
         'val_cases': len(val_set),
         'test_cases': len(test_set),
         'total_epochs': total_epochs,
-        'sampling_protocol': 'direct_uniform_from_source_grid',
-        'loaded_train_view_union': train_union_size,
+        'sampling_protocol': 'load_all_then_direct_uniform_per_case',
+        'source_view_policy': 'per_case_actual',
+        'source_view_range': list(args.source_view_range),
+        'projection_loading': 'all_views_per_case',
         'eval_views': args.final_view,
         'resolved_view_schedule': resolved_views,
         'tensorboard_dir': tensorboard_dir,
@@ -759,15 +857,10 @@ def train(args):
         for batch_index, batch in enumerate(train_loader):
             source_projs = batch['projs']
             source_angles = batch['angles']
-            if source_projs.shape[1] != batch['view_indices'].shape[1]:
-                raise ValueError(
-                    'Projection tensor and source-grid index union have '
-                    'different lengths'
-                )
             projs, angles = subsample_projections(
                 source_projs, current_views,
                 torch.device('cpu'), source_angles,
-                source_total=args.source_views,
+                source_total=batch['source_views'],
                 view_indices=batch['view_indices'],
             )
             projs = projs.to(device, non_blocking=pin_memory)
@@ -889,7 +982,7 @@ def train(args):
         if epoch % args.eval_every == 0 or epoch == total_epochs:
             validation_metrics = evaluate(
                 model, val_loader, device, criterion,
-                n_views=args.final_view, source_total=args.source_views,
+                n_views=args.final_view,
             )
             mask_available = not np.isnan(
                 float(validation_metrics['psnr_mask'])
@@ -981,7 +1074,6 @@ def train(args):
     criterion.set_weights(**best_loss_weights)
     test_metrics = evaluate(
         model, test_loader, device, criterion, n_views=args.final_view,
-        source_total=args.source_views,
     )
     for name, value in test_metrics.items():
         writer.add_scalar(f'Test/{name}', value, total_epochs)
@@ -1015,8 +1107,11 @@ if __name__=='__main__':
                    help='Final deployment/evaluation view count')
     p.add_argument('--view_schedule', type=str, default=None,
                    help='Optional full high-to-low override, e.g. "60,48,24,12,6"')
-    p.add_argument('--source_views', type=int, default=491,
-                   help='Expected number of projections in the original 360-degree grid')
+    p.add_argument(
+        '--source_views', type=int, default=-1,
+        help='-1 loads every case in full and adapts per case; a positive '
+             'value optionally asserts an identical source count',
+    )
     p.add_argument('--stage1_epochs', type=int, default=200,
                    help='Stage 1 epochs at the curriculum maximum with EMA updates enabled')
     p.add_argument('--stage2_epochs_per_view', type=int, default=40, help='阶段2 每个视角的训练轮数')

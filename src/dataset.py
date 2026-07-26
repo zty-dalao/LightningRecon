@@ -48,8 +48,7 @@ class ThoraxCTDataset(Dataset):
     """
     def __init__(self, data_root, split='train', n_views=-1,
                  proj_size=(256, 256), vol_size=(128, 128, 128),
-                 val_ratio=0.1, seed=42, expected_source_views=None,
-                 view_counts=None):
+                 val_ratio=0.1, seed=42, expected_source_views=None):
         super().__init__()
         self.data_root = data_root
         self.split = split
@@ -57,12 +56,6 @@ class ThoraxCTDataset(Dataset):
         self.proj_size = proj_size
         self.vol_size = vol_size
         self.expected_source_views = expected_source_views
-        self.view_counts = (
-            tuple(sorted({int(value) for value in view_counts}, reverse=True))
-            if view_counts is not None else None
-        )
-        if self.view_counts is not None and n_views != -1:
-            raise ValueError('Use either n_views or view_counts, not both')
 
         # ---- 目录 ----
         proj_dir = os.path.join(data_root, 'projections')
@@ -132,6 +125,7 @@ class ThoraxCTDataset(Dataset):
         self._max_projs = 0
         self._min_projs = float('inf')
         self._case_angles = {}
+        self._case_source_views = {}
         for case in self.cases:
             with open(os.path.join(proj_dir, f'{case}.pickle'), 'rb') as f:
                 data = pickle.load(f)
@@ -147,26 +141,19 @@ class ThoraxCTDataset(Dataset):
                     f'{case}: expected exactly {expected_source_views} source '
                     f'views, found {n}'
                 )
-            if self.view_counts is not None:
-                invalid_counts = [
-                    count for count in self.view_counts
-                    if count <= 0 or count > n
-                ]
-                if invalid_counts:
-                    raise ValueError(
-                        f'{case}: invalid requested view counts '
-                        f'{invalid_counts} for {n} source views'
-                    )
+            if self.n_views > n:
+                raise ValueError(
+                    f'{case}: requested {self.n_views} views from only {n}'
+                )
             self._max_projs = max(self._max_projs, n)
             self._min_projs = min(self._min_projs, n)
             self._case_angles[case] = angles
-        if self._min_projs != self._max_projs:
-            raise ValueError(
-                f'Split {split!r} mixes projection counts '
-                f'({self._min_projs}..{self._max_projs}); batching would not '
-                'preserve a single source grid.'
-            )
-        print(f'[ThoraxCTDataset] 原始投影数: {self._max_projs}')
+            self._case_source_views[case] = n
+        if self._min_projs == self._max_projs:
+            source_summary = str(self._max_projs)
+        else:
+            source_summary = f'{self._min_projs}..{self._max_projs}（逐病例）'
+        print(f'[ThoraxCTDataset] 原始投影数: {source_summary}')
 
     def __len__(self):
         return len(self.cases)
@@ -178,6 +165,10 @@ class ThoraxCTDataset(Dataset):
     @property
     def min_views(self):
         return self._min_projs
+
+    @property
+    def source_view_counts(self):
+        return dict(self._case_source_views)
 
     def ct_path(self, case_id):
         if case_id not in self.cases:
@@ -211,14 +202,7 @@ class ThoraxCTDataset(Dataset):
             )
 
         # ---- 采样 ----
-        if self.view_counts is None:
-            indices = self._uniform_indices(total, self.n_views)
-        else:
-            indices = np.asarray(sorted({
-                index
-                for count in self.view_counts
-                for index in uniform_view_indices(total, count)
-            }), dtype=np.int64)
+        indices = self._uniform_indices(total, self.n_views)
 
         # ---- 逐帧处理 ----
         out = []
@@ -231,7 +215,7 @@ class ThoraxCTDataset(Dataset):
             img = Image.fromarray(arr)
             img = img.resize(self.proj_size[::-1], Image.BILINEAR)
             out.append(np.array(img, dtype=np.float32))
-        return np.stack(out, axis=0), angles[indices], indices
+        return np.stack(out, axis=0), angles[indices], indices, total
 
     # =====================================================================
     # CT 体素加载 (NIfTI uint8)
@@ -288,7 +272,12 @@ class ThoraxCTDataset(Dataset):
 
     def __getitem__(self, index):
         case_id = self.cases[index]
-        projs, angles, view_indices = self._load_projections(case_id)
+        (
+            projs,
+            angles,
+            view_indices,
+            source_views,
+        ) = self._load_projections(case_id)
         ct    = self._load_ct(case_id)                    # (D, H, W)
         mask  = self._load_mask(case_id)                  # (D, H, W) or None
         result = {
@@ -296,6 +285,7 @@ class ThoraxCTDataset(Dataset):
             'projs': torch.from_numpy(projs).unsqueeze(1),  # (V, 1, H, W)
             'angles': torch.from_numpy(angles),              # (V,), radians
             'view_indices': torch.from_numpy(view_indices),  # (V,), original grid
+            'source_views': torch.tensor(source_views, dtype=torch.long),
             'ct':    torch.from_numpy(ct).unsqueeze(0),      # (1, D, H, W)
         }
         if mask is None:
