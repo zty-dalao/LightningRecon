@@ -1,6 +1,6 @@
 # SparseViewReconstruction 模型文档
 
-基于双码本先验 + FiLM 骨架调制 + 渐进式 Mask 课程学习的稀疏 CBCT 重建。
+基于双码本先验 + FiLM 骨架调制 + 视角课程学习的稀疏 CBCT 重建。
 
 **核心目标**：从 6~10 张稀疏 X 射线投影重建 CT 体素——**解剖结构和 HU 值分布均对齐 pCT**。
 
@@ -24,15 +24,15 @@ graph TD
         P3 --> P4["3D 特征体素 (64³×256ch)"]:::data
         P4 --> P5["HF 保留 64³ / MF 上采样至 128³"]:::module
         P5 --> P6["VQ 聚类构建双码本"]:::module
-        P6 --> P7[("高频码本 H<br>1024×128")]:::data
-        P6 --> P8[("中频码本 M<br>512×64")]:::data
+        P6 --> P7[("高频码本 H<br>512×128")]:::data
+        P6 --> P8[("中频码本 M<br>256×64")]:::data
         P7 --> P9["🔒 冻结码本"]:::frozen
         P8 --> P9
     end
 
     subgraph Stage2 [阶段二：主网络微调（稀疏视角，码本冻结）]
         direction TB
-        F1["目标锚定的内置视角课程<br>+ 真实角度编码"]:::data --> F2["共享权重 2D CNN<br>+ 4层跨视角 Transformer"]:::module
+        F1["从60/64-view基准集随机无放回抽样<br>+ 真实角度编码"]:::data --> F2["共享权重 2D CNN<br>+ 4层跨视角 Transformer"]:::module
         F2 --> F3["2D→3D 反投影"]:::module
         F3 --> F4["3D 特征体素 (64³×256ch)"]:::data
         F4 --> F5["HF 64³ / MF 上采样 128³"]:::module
@@ -63,9 +63,9 @@ graph TD
         F20 --> F21["最终体素输出"]:::data
     end
 
-    subgraph Stage3 [阶段三：固定目标协议微调]
+    subgraph Stage3 [阶段三：目标视角数随机子集微调]
         direction TB
-        I1["固定 final_view + 真实角度编码"]:::data --> I2["2D CNN + 4层跨视角 Transformer（可训练）"]:::module
+        I1["从基准集随机抽 final_view<br>+ 真实角度编码"]:::data --> I2["2D CNN + 4层跨视角 Transformer（可训练）"]:::module
         I2 --> I3["反投影 → 64³ 体素"]:::module
         I3 --> I4["查询冻结 EMA 码字及量化适配层"]:::module
         P7 -.-> I4
@@ -89,29 +89,36 @@ CNN 特征做残差相加。
 | 阶段 | Epoch | 视角 | 码本 | LR | 说明 |
 |------|-------|------|------|-----|------|
 | 阶段一 | 前200轮 | 60或64 | 🔓 EMA 更新 | encoder=1e-4 | 构建解剖码本 |
-| 阶段二 | 每级40轮 | 内置课程逐级降至`final_view` | 🔒 EMA 码字冻结 | encoder=5e-5 | 保留最终厂家角度的稀疏适应 |
-| 阶段三 | 最后100轮 | `final_view` | 🔒 EMA及量化适配层冻结 | encoder=1e-5, decoder=2e-5 | 目标稀疏协议微调 |
+| 阶段二 | 每级40轮 | 从最高视角基准集随机抽取课程指定数量 | 🔒 EMA 码字冻结 | encoder=5e-5 | 多角度子集稀疏适应 |
+| 阶段三 | 最后100轮 | 从同一基准集随机抽取`final_view` | 🔒 EMA及量化适配层冻结 | encoder=1e-5, decoder=2e-5 | 目标视角数微调 |
 
 **视角课程**：由 `--final_view` 选择内置确定性映射：
 
 | `final_view` | 阶段一及阶段二课程（高→低） | 阶段三 |
 |---|---|---|
-| 6 | 60→54→48→36→24→12→6 | 固定6 |
-| 8 | 64→56→48→32→24→16→8 | 固定8 |
-| 10 | 60→50→40→30→20→10 | 固定10 |
+| 6 | 60→54→48→36→24→12→6 | 从60中随机抽6 |
+| 8 | 64→56→48→32→24→16→8 | 从64中随机抽8 |
+| 10 | 60→50→40→30→20→10 | 从60中随机抽10 |
 
 默认总计：6/8-view为 **540 epochs**，10-view为 **500 epochs**。
 
-可用 `--view_schedule` 提供完整高到低序列覆盖内置映射；覆盖序列仍须保持最终视角角度锚定。
+可用 `--view_schedule` 提供完整高到低序列覆盖内置映射；最高视角数必须能
+被 `final_view` 整除，以便定义固定、可复现的验证和厂家部署子集。
 
 对每个病例，先读取其实际原始视角数 `V_case`（可以是491、464或其他值），
-数据集以 `--source_views -1` 加载该病例的全部投影，再按
-`floor(k×V_case/n_views)` 从该病例自己的全旋转网格直接选择每一级视角，
-不经过60/64-view二次下采样。不同病例只要求实际视角数不少于课程最大
-视角数，不要求原始总数一致。变长全视角数据在 batch 中保持为列表，
-采样成相同的阶段视角数之后才堆叠，不做补零填充。训练集用于更新参数，
-验证集用于选择 best checkpoint，测试集只在训练结束后对 best checkpoint
-评估一次。
+数据集以 `--source_views -1` 加载该病例的全部投影。首先按
+`base[j] = floor(j×V_case/B)` 均匀建立最高视角基准集，其中 6/10-view
+任务的 `B=60`，8-view 任务的 `B=64`。阶段一完整使用这个有序基准集；
+阶段二和阶段三每个训练 batch 都从基准集随机无放回抽取当前要求的视角数，
+然后按原始采集顺序排序，投影与真实角度始终成对。
+
+验证、测试和推理不随机：它们从基准集按
+`floor(k×B/final_view)` 选取固定厂家子集。因此同一 checkpoint 的指标完全
+可重复，而训练可以见到更多基准角度组合。不同病例只要求实际视角数不少于
+课程最大视角数，不要求原始总数一致。变长全视角数据在 batch 中保持为列表，
+抽成相同视角数后才堆叠，不做补零填充。训练集用于更新参数，验证集按照
+逐病例平均的完整体积 PSNR 选择 best checkpoint，测试集只在训练结束后对
+best checkpoint 评估一次。验证与测试只输出完整体积 PSNR、SSIM 和损失指标。
 
 ----
 
@@ -134,8 +141,8 @@ L_total = w_img·L_img + w_lap·L_lap + w_struct·L_struct + w_vq·L_vq
 | 项目 | 说明 |
 |------|------|
 | **公式** | `√((pred−ct)² + ε²)`, ε=1e-3 |
-| **计算区域** | **body mask 内**（仅计算身体区域 HU 误差） |
-| **作用** | 直接优化 mask 内 HU 值精度，L1 平滑版本梯度更稳定 |
+| **计算区域** | **完整 CT 体积** |
+| **作用** | 优化完整体积 HU 值精度，L1 平滑版本梯度更稳定 |
 
 ### 2. L_lap — 拉普拉斯金字塔损失（权重 0.02~0.05，辅助）
 
@@ -155,8 +162,9 @@ L_total = w_img·L_img + w_lap·L_lap + w_struct·L_struct + w_vq·L_vq
 `sigma=1.5`、`win_size=11`、`data_range=1.0`、
 `use_sample_covariance=False`、`channel_axis=None`（即 `11×11×11`
 三维窗口），然后对病例平均。TensorBoard 还分别记录 HF/MF 码本的 perplexity、
-batch/EMA active fraction、active codes 和 dead codes，以及各加权损失
-对总损失的贡献比例。
+normalized perplexity（`perplexity / 码字数`）、batch/EMA active fraction、
+active/dead codes、dead-code 单次及累计重初始化数，以及各加权损失对总损失的
+贡献比例。
 
 ---
 
@@ -165,14 +173,16 @@ batch/EMA active fraction、active codes 和 dead codes，以及各加权损失
 | 决策 | 原因 |
 |------|------|
 | **阶段二开始冻结EMA码字** | 码本存储通用解剖先验，后续不应被稀疏视角的残缺特征污染 |
+| **跨病例 K-means 初始化** | 阶段一从前 8 个打乱的训练 batch 分批收集固定总量的均匀特征，再统一聚类，降低首个病例偏置 |
+| **dead-code 重初始化** | 仅在阶段一 EMA 可更新时定期把长期未使用码字替换成当前均匀抽样特征；阶段二、三冻结后不再执行 |
+| **第一轮保持均匀特征采样** | 不依赖外部区域标注；先观察前 50 轮利用率，再决定是否加入结构感知混合采样 |
 | **HF 64³ / MF 128³** | HF 小尺寸存细节纹理，MF 大尺寸存器官轮廓骨架 |
 | **L_lap + L_struct 都用 CT** | 不再使用 CBCT，CT 同时提供精准 HU 和清晰边缘，双损失互补 |
 | **先上采样再 FiLM** | 避免特征维度错位导致的伪影 |
 | **Add 融合而非 Concat** | 通道数不翻倍，显存减半 |
-| **渐进式 Mask（非切换）** | 网络从 Day1 就在学"补全"，避免 Catastrophic Forgetting |
 | **3D 全局池化 → FiLM 条件** | 用整体风格向量调制局部特征，比逐像素调制更鲁棒 |
 | **EMA 码本（非梯度码本）** | 梯度码本易坍缩 (SSIM≈0)；EMA 指数移动平均更新码字，避免死神经元 |
-| **分块距离计算** | 128³ 体积 × 512 码字 = 4GB 矩阵 → 自动分块 (≤256MB/块)，避免 OOM |
+| **分块距离计算** | 128³ 体积 × 256 码字仍会产生约 2GB 距离矩阵 → 自动分块 (≤256MB/块)，避免 OOM |
 
 ---
 
@@ -204,14 +214,28 @@ class EmbeddingEMA:
 | `decay` | 0.99 | EMA 衰减速率为 0.99，稳定更新 |
 | `beta` | 0.25 | commitment loss 权重 |
 | `eps` | 1e-5 | 拉普拉斯平滑系数 |
+| `kmeans_iters` | 10 | Lloyd K-means 迭代数 |
+| `kmeans_samples_per_code` | 4 | 每个码字均匀抽取 4 个当前特征作为初始化样本上限 |
+| `kmeans_init_batches` | 8 | 将初始化样本预算均匀分散到前 8 个训练 batch |
+| `dead_code_threshold` | 0.1 | EMA cluster size 低于此值视为 dead code |
+| `dead_code_check_interval` | 100 | 每 100 个 EMA 更新 forward 检查一次 |
+| `dead_code_warmup_steps` | 100 | 前 100 个 EMA 更新 forward 不做 dead-code 重置 |
 | 距离精度 | fp32 | 强制 float32 计算距离，防止 AMP fp16 溢出 NaN |
+
+初始化特征池、已收集数量、batch进度、初始化状态、EMA更新步数和dead-code
+累计重置数都是模型buffer，会随checkpoint保存和恢复。正式第1轮优化开始前，
+程序保持网络权重不变，以无梯度预扫描方式读取8个打乱的训练batch；前7个
+batch只收集特征，第8个batch收集完成后执行一次K-means，随后才建立优化器并
+进入训练。验证、推理和断点续训不会重复初始化。空聚类的EMA计数保持为0，
+不会再被提前统计成active。初始化与dead-code替换均为普通均匀特征抽样，
+不读取外部区域标注，也没有启用结构感知偏置。
 
 ### 分块计算：避免 O(N×K) 矩阵 OOM
 
 ```
 问题：einsum('bd,nd->bn', z, w) 产生的距离矩阵：
-  HF 码本：64³ × 1024 = 262K × 1024 = 1.0 GB
-  MF 码本：128³ × 512  = 2.1M × 512  = 4.3 GB  ← OOM!
+  HF 码本：64³ × 512 = 262K × 512 = 0.5 GB
+  MF 码本：128³ × 256 = 2.1M × 256 = 2.1 GB  ← 仍可能 OOM
 
 解决：自适应分块
   chunk_size = 256MB / (num_tokens × 4)
@@ -223,8 +247,18 @@ class EmbeddingEMA:
 
 | 码本 | 体积 | 通道 | 码字数 | 分块数 | 峰值显存 | 用途 |
 |------|------|------|--------|--------|----------|------|
-| HF | 64³ | 128 | 1024 | ~4 | 256 MB | 高频细节纹理 |
-| MF | 128³ | 64 | 512 | ~32 | 128 MB | 中频器官轮廓 |
+| HF | 64³ | 128 | 512 | ~2 | 256 MB | 高频细节纹理 |
+| MF | 128³ | 64 | 256 | ~8 | 256 MB | 中频器官轮廓 |
+
+### 前 50 轮利用率观察
+
+当前版本不自动切换到结构感知采样。训练前 50 轮会逐轮在控制台打印并在
+TensorBoard 的 `Codebook/` 下记录 HF/MF 的 `ema_active_fraction` 和
+`normalized_perplexity`，第 50 轮还会生成 `Codebook/Epoch50Review` 文本摘要。
+建议同时查看最后 10 轮趋势，而不是只看第 50 轮单点：如果某一级码本的
+batch/EMA active fraction 长期低于约 20%，且 normalized perplexity 长期低于
+约 10%，再在下一版启用结构感知混合采样。dead-code 刚重置的码字不会被提前
+计作 active，必须再次被真实特征选中后才算活跃。
 
 ---
 
@@ -237,7 +271,7 @@ class EmbeddingEMA:
 | `--stage1_epochs` | 200 | 阶段一最高视角预训练轮数 |
 | `--final_view` | 6 | 最终训练、验证和推理视角；可选6/8/10 |
 | `--view_schedule` | 空 | 可选完整覆盖序列，如`"60,48,36,24,12,6"` |
-| `--run_version` | 必填 | 唯一运行版本，如`v3`；已有非空版本目录不会被覆盖 |
+| `--run_version` | 必填 | 唯一运行版本，如`v7`；已有非空版本目录不会被覆盖 |
 | `--source_views` | -1 | 加载每个病例的全部视角并自适应；正整数仅作为所有病例原始视角数一致的可选断言 |
 | `--resume` | 空 | 从 best、periodic 或 last checkpoint 完整恢复 |
 | `--stage2_epochs_per_view` | 40 | 阶段二每个视角级训练轮数 |
@@ -247,10 +281,39 @@ class EmbeddingEMA:
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--vol_size` | 128 128 128 | 输出体素尺寸 |
+| `--vol_size` | 128 128 128 | CT 标签体素尺寸；必须与解码器输出尺寸一致 |
 | `--proj_size` | 128 128 | 投影图 resize 尺寸 |
 | `--transformer_layers` | 4 | 跨视角 `TransformerEncoderLayer` 堆叠数；写入 checkpoint 并由推理读取 |
-| `--n_decoder_ups` | 1 | 解码器上采样次数 (1=256³, 2=512³; 2 需 >24GB) |
+| `--hf_codebook_size` | 512 | HF 码字数 |
+| `--mf_codebook_size` | 256 | MF 码字数 |
+| `--kmeans_iters` | 10 | 首次 K-means 初始化迭代数 |
+| `--kmeans_samples_per_code` | 4 | K-means 均匀特征样本数倍率 |
+| `--kmeans_init_batches` | 8 | K-means初始化跨越的打乱训练batch数 |
+| `--dead_code_threshold` | 0.1 | dead code 的 EMA cluster-size 阈值 |
+| `--dead_code_check_interval` | 100 | dead-code 检查间隔（EMA forward 次数） |
+| `--dead_code_warmup_steps` | 100 | dead-code 检查预热（EMA forward 次数） |
+| `--n_decoder_ups` | 1 | 解码器上采样次数（0=128³、1=256³、2=512³；2 需 >24GB） |
+
+`--vol_size` 控制数据集生成的 CT 标签尺寸，`--n_decoder_ups` 控制模型输出尺寸。
+二者必须使用以下确定性对应关系，避免训练时将已经缩放过的 CT 标签再次插值：
+当前两个参数的命令行默认值分别为 `128 128 128` 和 `1`，属于历史默认组合，
+因此正式训练时不要同时省略它们，必须按下表显式传入。
+
+| 目标重建尺寸 | `--vol_size` | `--n_decoder_ups` |
+|---|---|---:|
+| 128³ | `128 128 128` | 0 |
+| 256³（推荐） | `256 256 256` | 1 |
+| 512³（4090D 不推荐） | `512 512 512` | 2 |
+
+例如，训练真正的 256³ 输出时必须同时写为：
+
+```bash
+--vol_size 256 256 256 \
+--n_decoder_ups 1
+```
+
+不要组合 `--vol_size 256 256 256 --n_decoder_ups 0`，因为它会产生 256³
+CT 标签和 128³ 模型输出，仍然需要插值才能计算损失。
 
 ### 优化
 
@@ -280,8 +343,8 @@ cd /root/autodl-tmp/LightningRecon
 # ═══════════════════════════════════════════════════════════════
 python src/train.py \
     --data_root /root/autodl-tmp/thorax \
-    --vol_size 128 128 128 --proj_size 128 128 \
-    --final_view 6 --source_views -1 --run_version v3 \
+    --vol_size 256 256 256 --proj_size 128 128 \
+    --final_view 6 --source_views -1 --run_version v7 \
     --stage1_epochs 200 --stage2_epochs_per_view 40 \
     --stage3_epochs 100 \
     --n_decoder_ups 1 --grad_accum 8 --batch_size 1 --num_workers 2
@@ -291,8 +354,8 @@ python src/train.py \
 # ═══════════════════════════════════════════════════════════════
 python src/train.py \
     --data_root /root/autodl-tmp/thorax \
-    --vol_size 128 128 128 --proj_size 128 128 \
-    --final_view 6 --source_views -1 --run_version v3 \
+    --vol_size 512 512 512 --proj_size 128 128 \
+    --final_view 6 --source_views -1 --run_version v7 \
     --stage1_epochs 200 --stage2_epochs_per_view 40 \
     --stage3_epochs 100 \
     --n_decoder_ups 2 --grad_accum 8 --batch_size 1 --num_workers 2
@@ -302,8 +365,8 @@ python src/train.py \
 # ═══════════════════════════════════════════════════════════════
 python src/train.py \
     --data_root /root/autodl-tmp/thorax \
-    --vol_size 128 128 128 --proj_size 128 128 \
-    --final_view 6 --source_views -1 --run_version v3 --stage1_epochs 10 \
+    --vol_size 256 256 256 --proj_size 128 128 \
+    --final_view 6 --source_views -1 --run_version v7 --stage1_epochs 10 \
     --stage2_epochs_per_view 1 --stage3_epochs 0 \
     --n_decoder_ups 1 --grad_accum 2 --batch_size 1 --num_workers 0
 
@@ -312,8 +375,8 @@ python src/train.py \
 # ═══════════════════════════════════════════════════════════════
 python src/train.py \
     --data_root /root/autodl-tmp/thorax \
-    --vol_size 128 128 128 --proj_size 128 128 \
-    --final_view 6 --source_views -1 --run_version v3 --stage1_epochs 1 \
+    --vol_size 256 256 256 --proj_size 128 128 \
+    --final_view 6 --source_views -1 --run_version v7 --stage1_epochs 1 \
     --stage2_epochs_per_view 1 \
     --stage3_epochs 1 \
     --n_decoder_ups 1 --grad_accum 2 --batch_size 1 --num_workers 0
@@ -322,23 +385,29 @@ python src/train.py \
 # ⑤ 推理
 # ═══════════════════════════════════════════════════════════════
 python src/inference.py \
-    --checkpoint 'logs/thorax_fast_finalview=6_256_v3/best_model_finalview=6_v3.pth' \
+    --checkpoint 'logs/thorax_fast_finalview=6_256_v7/best_model_finalview=6_v7.pth' \
     --data_root /root/autodl-tmp/thorax --case_id CASE_ID \
     --final_view 6 --source_views -1
 
 # TensorBoard
-tensorboard --logdir 'logs/thorax_fast_finalview=6_256_v3/tensorboard'
+tensorboard --logdir 'logs/thorax_fast_finalview=6_256_v7/tensorboard'
 ```
 
 训练程序会根据实际的 `--run_version` 构造运行目录，并在启动时打印本次
-运行专用的 TensorBoard 命令。例如传入 `--run_version v3` 时，日志目录
-为 `thorax_fast_finalview=6_256_v3/tensorboard`；传入 `v4` 时则自动变为
-对应的 `_v4/tensorboard`，不需要手工修改训练代码。
+运行专用的 TensorBoard 命令。例如传入 `--run_version v7` 时，日志目录
+为 `thorax_fast_finalview=6_256_v7/tensorboard`；后续传入 `v8` 时会自动
+变为对应的 `_v8/tensorboard`，不需要手工修改训练代码。由于本次增加了可恢复
+的跨batch K-means初始化状态并更新了checkpoint格式，不能从v6或更早的
+checkpoint resume，必须使用新版本名开始训练。
 
 当前版本只主动写入以下 TensorBoard 内容：
 
 - `Run/Metadata`
 - `Train/Loss/*` 与 `Train/LossContribution/*`
+- `Codebook/hf_normalized_perplexity`、`Codebook/mf_normalized_perplexity`
+- `Codebook/*_batch_active_fraction`、`Codebook/*_ema_active_fraction`
+- `Codebook/*_dead_codes_reinitialized` 与累计重初始化数
+- `Codebook/Epoch50Review`
 - `Train/LearningRate/*`、`Train/n_views`、`Train/Stage`
 - `Codebook/*`
 - `Val/*` 与 `Test/*`
@@ -373,16 +442,16 @@ LightningRecon/
 │   │                      - EMAVectorQuantizer: 单层 VQ (分块 argmin)
 │   │                      - EMAVectorQuantizer3D: 3D 封装 (pre/post 1×1×1 conv)
 │   ├── losses.py        # laplacian_pyramid_loss, structural_loss, ReconstructionLoss
-│   ├── dataset.py       # ThoraxCTDataset (pickle投影+CT体素+mask)
-│   ├── train.py         # 三阶段训练脚本 (grad_accum, masked PSNR, AMP)
+│   ├── dataset.py       # ThoraxCTDataset (pickle投影+CT体素)
+│   ├── train.py         # 三阶段训练脚本 (grad_accum, whole-volume PSNR, AMP)
 │   └── inference.py     # 推理脚本
 ├── tests/
 │   ├── test_dataset.py  # 数据集加载测试
 │   └── baseline_psnr.py # CBCT vs CT 基线 PSNR/SSIM 计算
 ├── logs/                # 训练日志 + TensorBoard
-│   └── thorax_fast_finalview=6_256_v3/
-│       ├── best_model_finalview=6_v3.pth
-│       ├── ckpt_0050_finalview=6_v3.pth
+│   └── thorax_fast_finalview=6_256_v7/
+│       ├── best_model_finalview=6_v7.pth
+│       ├── ckpt_0050_finalview=6_v7.pth
 │       ├── config.json
 │       └── tensorboard/
 ├── data/thorax_fast/    # 原始数据（投影 npy + 预处理脚本）

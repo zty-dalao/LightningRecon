@@ -85,8 +85,6 @@ def main():
     for case in cases:
         cbct_path = os.path.join(overlap_dir, f'{case}_cbct.nii.gz')
         ct_path   = os.path.join(overlap_dir, f'{case}_ct.nii.gz')
-        mask_cbct = os.path.join(overlap_dir, f'{case}_cbct_mask.nii.gz')
-        mask_ct   = os.path.join(overlap_dir, f'{case}_ct_mask.nii.gz')
 
         if not all(os.path.exists(p) for p in [cbct_path, ct_path]):
             print(f'{case:<30} {"SKIP (文件缺失)":>50}')
@@ -99,29 +97,15 @@ def main():
         cbct_n = np.clip((cbct - vmin) / (vmax - vmin), 0, 1)
         pct_n  = np.clip((pct  - vmin) / (vmax - vmin), 0, 1)
 
-        # Mask: 取 CBCT 和 CT 均有解剖结构的区域
-        mask = np.ones(cbct.shape, dtype=bool)
-        if os.path.exists(mask_cbct) and os.path.exists(mask_ct):
-            m_cbct = load_nii(mask_cbct) > 0.5
-            m_ct   = load_nii(mask_ct) > 0.5
-            mask = m_cbct & m_ct
-            if mask.sum() == 0:
-                mask = np.ones(cbct.shape, dtype=bool)
-
-        # 在 mask 区域内计算
-        cbct_m = cbct_n[mask]
-        pct_m  = pct_n[mask]
-
-        psnr = compute_psnr(cbct_m, pct_m)
-        ssim = compute_ssim(cbct_m, pct_m)
+        psnr = compute_psnr(cbct_n, pct_n)
+        ssim = compute_ssim(cbct_n, pct_n)
 
         psnrs.append(psnr)
         ssims.append(ssim)
 
-        mask_pct = np.sum(mask) / mask.size * 100
         print(f'{case:<30} {psnr:>10.2f} {ssim:>8.4f} '
               f'{cbct.min():>10.1f} {cbct.max():>10.1f} '
-              f'{pct.min():>10.1f} {pct.max():>10.1f} (mask {mask_pct:.1f}%)')
+              f'{pct.min():>10.1f} {pct.max():>10.1f}')
 
     print('-' * 90)
     print(f'{"均值":<30} {np.mean(psnrs):>10.2f} {np.mean(ssims):>8.4f}')
