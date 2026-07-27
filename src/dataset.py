@@ -91,6 +91,12 @@ class ThoraxCTDataset(Dataset):
                     self.cases = [c for c in d[split] if c in valid_cases]
                     split_source = os.path.basename(sp)
                     break
+                # splits.json 可能用 'eval' 而非 'val'
+                alias = 'eval' if split == 'val' else ('val' if split == 'eval' else None)
+                if alias and alias in d:
+                    self.cases = [c for c in d[alias] if c in valid_cases]
+                    split_source = os.path.basename(sp)
+                    break
         if split_source is None and metadata_found:
             raise KeyError(
                 f'Existing split metadata does not define split={split!r}; '
