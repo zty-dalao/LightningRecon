@@ -143,11 +143,11 @@ class EMAVectorQuantizer(nn.Module):
         if sample_count is None:
             sample_count = self.num_tokens * self.kmeans_samples_per_code   # 码本中有多少个码字 × 4。这样每个码字平均有 4 个候选样本做 K-means。
         # 不请求超过当前特征总数的样本。
-        sample_count = min(z.shape[0], int(sample_count))                   # 上限截断。如果当前 batch 的体素数 N 还没采样量多，就把采样量降到 N。比如 batch=1、特征图 8³=512 体素时，2048 不可能，降到 512
-        if sample_count < self.num_tokens:                                  # 特征太少则报错。K-means 要求样本数 ≥ 码字数（否则聚类中心比样本还多，没意义）。这个检查确保不会在极小的特征图上运行。
+        sample_count = min(z.shape[0], int(sample_count))                   # 上限截断。跨 batch 蓄水时，单批采样数可以小于码字数；只要求最终累计样本数不少于码字数。
+        if sample_count <= 0:
             raise ValueError(
-                f'K-means needs at least {self.num_tokens} feature vectors, '
-                f'got {z.shape[0]}'
+                f'feature sampling needs at least one vector, got '
+                f'z.shape={tuple(z.shape)} and sample_count={sample_count}'
             )
         if sample_count == z.shape[0]:                                      # 全取，直接返回。如果要采的量恰好等于全量，就不做随机采样，直接返回全部特征。省去无意义的 randint + index_select 开销。
             return z
@@ -201,6 +201,14 @@ class EMAVectorQuantizer(nn.Module):
     def _initialize_with_kmeans(self, z):
         """Initialize all codewords from a bounded uniform feature sample."""
         samples = self._uniform_feature_sample(z)
+        # “样本数不少于码字数”是启动 K-means 的整体约束，而不是每个
+        # reservoir 分片的约束。默认512码字、4样本/码字、8个batch时，
+        # 每批只采256个，但累计得到2048个有效样本。
+        if samples.shape[0] < self.num_tokens:
+            raise ValueError(
+                f'K-means needs at least {self.num_tokens} accumulated '
+                f'feature vectors, got {samples.shape[0]}'
+            )
         # 从样本中无放回选择初始中心，保证起始码字对应真实特征。
         initial_indices = torch.randperm(
             samples.shape[0], device=samples.device

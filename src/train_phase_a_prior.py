@@ -208,10 +208,6 @@ def train(args) -> None:
     run_dir = prepare_run_directory(
         args.log_dir, run_name, resume=args.resume
     )
-    writer = SummaryWriter(
-        run_dir / "tensorboard",
-        purge_step=None,
-    )
 
     train_set = ThoraxFastDataset(
         args.data_root,
@@ -283,6 +279,12 @@ def train(args) -> None:
     else:
         initialize_codebooks(model, train_loader, device, use_amp)
 
+    # K-means 成功或 checkpoint 成功恢复后再创建事件文件。这样初始化阶段
+    # 若报错，不会仅因残留 TensorBoard 文件阻止同一版本重新运行。
+    writer = SummaryWriter(
+        run_dir / "tensorboard",
+        purge_step=start_epoch if args.resume else None,
+    )
     config = vars(args).copy()
     config.update(
         {

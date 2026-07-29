@@ -27,6 +27,7 @@ from src.dual_domain.training_utils import (
     save_checkpoint,
     select_views,
 )
+from src.ema_codebook import EMAVectorQuantizer
 
 
 class ThoraxFastDatasetTest(unittest.TestCase):
@@ -142,6 +143,28 @@ class DualDomainModelTest(unittest.TestCase):
 
 
 class TrainingEntrypointTest(unittest.TestCase):
+    def test_kmeans_reservoir_accepts_sub_codebook_batch_chunks(self):
+        # 32个reservoir样本分8批收集时，每批只取4个，小于8个码字。
+        # 单批不应报错；第8批累计样本充足后才启动K-means。
+        quantizer = EMAVectorQuantizer(
+            n_embed=8,
+            embedding_dim=3,
+            kmeans_iters=2,
+            kmeans_samples_per_code=4,
+            kmeans_init_batches=8,
+        ).train()
+        features = torch.randn(32, 3)
+        for batch_index in range(8):
+            quantized, loss, perplexity = quantizer(features)
+            self.assertEqual(quantized.shape, features.shape)
+            self.assertTrue(torch.isfinite(loss))
+            self.assertTrue(torch.isfinite(perplexity))
+            self.assertEqual(
+                bool(quantizer.kmeans_initialized.item()),
+                batch_index == 7,
+            )
+        self.assertEqual(int(quantizer.kmeans_reservoir_count.item()), 32)
+
     def test_phase_c_default_schedule_and_stage_boundaries(self):
         args = Namespace(
             final_view=6,
