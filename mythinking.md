@@ -859,5 +859,5 @@ NeRF与CT重建的结合点在于：CT的投影过程与NeRF的渲染过程在�
 >
 > 本文件包含早期 DeepSparse/PointDecoder 方案的实验记录，其中的
 > `CBCT_dataset_LR`、随机视角、PointDecoder 和旧码本流程已经停用。
-> 当前可执行协议与参数以 `mymodel.md`、`src/train.py` 和
-> `src/inference.py` 为准。
+> 旧模型及其训练/推理入口已经移除。当前架构与数据接口以
+> `mymodel.md` 和 `src/dual_domain/README.md` 为准。
