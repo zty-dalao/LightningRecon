@@ -16,7 +16,10 @@ from src.dual_domain import (
     DualDomainReconstructionModel,
     LearnedForwardProjector,
 )
-from src.thorax_fast_dataset import ThoraxFastDataset
+from src.thorax_fast_dataset import (
+    ThoraxFastDataset,
+    resolve_thorax_fast_root,
+)
 from src.train_phase_c_reconstruction import build_schedule, stage_for_epoch
 from src.dual_domain.training_utils import (
     accumulation_window_size,
@@ -38,6 +41,7 @@ class ThoraxFastDatasetTest(unittest.TestCase):
             ct_dir = root / "processed" / "images" / "ct"
             projection_dir.mkdir(parents=True)
             ct_dir.mkdir(parents=True)
+            self.assertEqual(resolve_thorax_fast_root(root), root.resolve())
             (root / "splits.json").write_text(
                 json.dumps({"train": ["case"]}), encoding="utf-8"
             )

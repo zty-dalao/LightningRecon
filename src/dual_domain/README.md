@@ -35,20 +35,22 @@
 当 `projection_views=None` 时，加载器会根据 `final_view` 自动选择 60-view
 （最终6/10 views）或64-view（最终8 views）基准集。
 
+训练入口省略 `--data_root` 时会依次检查项目内 `data/thorax_fast` 和
+`~/autodl-tmp/thorax`；显式传入 `--data_root` 时始终使用指定目录。
+
 ## 推荐训练顺序
 
 ```bash
 # Phase A：CT 解剖先验
 python -m src.train_phase_a_prior \
-  --data_root data/thorax_fast --run_version v3 --amp
+  --run_version v3 --amp
 
 # Phase B：CBCT 体素到真实投影
 python -m src.train_phase_b_projector \
-  --data_root data/thorax_fast --run_version v3 --amp
+  --run_version v3 --amp
 
 # Phase C：双域主重建
 python -m src.train_phase_c_reconstruction \
-  --data_root data/thorax_fast \
   --phase_a_checkpoint logs/thorax_phaseA_prior_v3/phase_A_best_v3.pth \
   --phase_b_checkpoint logs/thorax_phaseB_projector_v3/phase_B_best_v3.pth \
   --run_version v3 --final_view 6 --amp

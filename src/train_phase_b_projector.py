@@ -29,7 +29,10 @@ from src.dual_domain.training_utils import (
     set_global_seed,
     validate_run_version,
 )
-from src.thorax_fast_dataset import ThoraxFastDataset
+from src.thorax_fast_dataset import (
+    ThoraxFastDataset,
+    resolve_thorax_fast_root,
+)
 
 
 PHASE = "B"
@@ -125,6 +128,8 @@ def build_payload(
 
 def train(args) -> None:
     validate_run_version(args.run_version)
+    args.data_root = str(resolve_thorax_fast_root(args.data_root))
+    print(f"[Phase B] data_root={args.data_root}")
     if min(
         args.epochs,
         args.batch_size,
@@ -383,7 +388,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Phase B: train volume-to-projection model"
     )
-    parser.add_argument("--data_root", required=True)
+    parser.add_argument(
+        "--data_root",
+        default=None,
+        help=(
+            "Thorax Fast根目录；省略时依次检查项目内data/thorax_fast和"
+            "~/autodl-tmp/thorax"
+        ),
+    )
     parser.add_argument("--run_version", required=True)
     parser.add_argument("--log_dir", default="./logs")
     parser.add_argument("--epochs", type=int, default=150)

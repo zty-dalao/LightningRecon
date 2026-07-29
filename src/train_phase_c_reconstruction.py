@@ -37,7 +37,10 @@ from src.dual_domain.training_utils import (
     volume_metrics,
     volume_psnr_per_case,
 )
-from src.thorax_fast_dataset import ThoraxFastDataset
+from src.thorax_fast_dataset import (
+    ThoraxFastDataset,
+    resolve_thorax_fast_root,
+)
 from src.view_protocol import resolve_view_curriculum
 
 
@@ -368,6 +371,8 @@ def build_payload(
 
 def train(args) -> None:
     validate_run_version(args.run_version)
+    args.data_root = str(resolve_thorax_fast_root(args.data_root))
+    print(f"[Phase C] data_root={args.data_root}")
     positive = (
         args.stage1_epochs,
         args.stage2_epochs_per_view,
@@ -808,7 +813,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Phase C: train dual-domain sparse-view reconstruction"
     )
-    parser.add_argument("--data_root", required=True)
+    parser.add_argument(
+        "--data_root",
+        default=None,
+        help=(
+            "Thorax Fast根目录；省略时依次检查项目内data/thorax_fast和"
+            "~/autodl-tmp/thorax"
+        ),
+    )
     parser.add_argument("--phase_a_checkpoint", required=True)
     parser.add_argument("--phase_b_checkpoint", required=True)
     parser.add_argument("--run_version", required=True)

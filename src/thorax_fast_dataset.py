@@ -27,17 +27,65 @@ from torch.utils.data import Dataset
 from src.view_protocol import resolve_view_curriculum, uniform_view_indices
 
 
-def _resolve_layout(data_root: str | os.PathLike) -> tuple[Path, Path]:
-    """返回 ``(dataset_root, processed_root)``，兼容根目录和 processed 目录。"""
-    root = Path(data_root).expanduser().resolve()
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _layout_if_valid(root: Path) -> tuple[Path, Path] | None:
+    """识别数据集根目录或其 ``processed`` 子目录。"""
     if (root / "processed").is_dir():
         return root, root / "processed"
     if (root / "projections").is_dir() and (root / "images").is_dir():
         return root.parent, root
+    return None
+
+
+def resolve_thorax_fast_root(
+    data_root: str | os.PathLike | None = None,
+) -> Path:
+    """解析 Thorax Fast 根目录。
+
+    显式 ``data_root`` 始终优先且无效时直接报错。未提供时依次检查项目内
+    ``data/thorax_fast``、当前工作目录下的同名路径，以及
+    ``~/autodl-tmp/thorax``。
+    """
+    if data_root is not None:
+        candidates = [Path(data_root).expanduser().resolve()]
+    else:
+        candidates = [
+            (PROJECT_ROOT / "data" / "thorax_fast").resolve(),
+            (Path.cwd() / "data" / "thorax_fast").resolve(),
+            (Path.home() / "autodl-tmp" / "thorax").resolve(),
+        ]
+
+    # 项目目录和当前工作目录可能解析到同一路径，保持优先级并去重。
+    unique_candidates = list(dict.fromkeys(candidates))
+    for candidate in unique_candidates:
+        layout = _layout_if_valid(candidate)
+        if layout is not None:
+            return layout[0]
+
+    searched = "\n  - ".join(str(path) for path in unique_candidates)
+    if data_root is None:
+        raise FileNotFoundError(
+            "未自动发现 Thorax Fast 数据集，已检查：\n"
+            f"  - {searched}\n"
+            "请使用 --data_root 显式指定数据集根目录。"
+        )
     raise FileNotFoundError(
-        f"无法识别 Thorax Fast 目录 {root}；需要包含 processed/，"
-        "或直接指向同时包含 projections/ 与 images/ 的目录。"
+        f"无法识别 Thorax Fast 目录 {unique_candidates[0]}；需要包含 "
+        "processed/，或直接指向同时包含 projections/ 与 images/ 的目录。"
     )
+
+
+def _resolve_layout(
+    data_root: str | os.PathLike | None,
+) -> tuple[Path, Path]:
+    """返回 ``(dataset_root, processed_root)``，兼容根目录和 processed 目录。"""
+    root = resolve_thorax_fast_root(data_root)
+    layout = _layout_if_valid(root)
+    if layout is None:  # pragma: no cover - resolver已经保证该条件不成立
+        raise RuntimeError(f"已解析的数据集目录突然失效：{root}")
+    return layout
 
 
 def _load_split_mapping(dataset_root: Path, processed_root: Path) -> dict:
@@ -85,7 +133,7 @@ class ThoraxFastDataset(Dataset):
 
     def __init__(
         self,
-        data_root: str | os.PathLike,
+        data_root: str | os.PathLike | None = None,
         split: str = "train",
         volume_keys: Iterable[str] = ("ct",),
         projection_views: int | None = None,

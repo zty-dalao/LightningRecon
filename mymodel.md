@@ -24,7 +24,18 @@ codebook 解码为 128³ 粗糙基础体积
 
 ## 2. Thorax Fast 数据格式
 
-数据根目录为 `data/thorax_fast`：
+数据根目录支持以下两个默认位置：
+
+```text
+<项目目录>/data/thorax_fast
+~/autodl-tmp/thorax
+```
+
+三个训练入口的 `--data_root` 现在是可选参数。省略时按上述顺序自动检查，
+项目内数据优先；实际选中的绝对路径会打印到终端并写入 `config.json`。
+如果数据位于其它目录，仍可用 `--data_root /path/to/data` 显式覆盖。
+
+项目内目录结构为：
 
 ```text
 data/thorax_fast/
@@ -300,7 +311,6 @@ CBCT体素 + 真实角度
 
 ```bash
 python -m src.train_phase_a_prior \
-  --data_root data/thorax_fast \
   --run_version v3 \
   --epochs 200 \
   --batch_size 1 \
@@ -336,7 +346,6 @@ logs/thorax_phaseA_prior_v3/phase_A_epoch=XXXX_v3.pth
 
 ```bash
 python -m src.train_phase_b_projector \
-  --data_root data/thorax_fast \
   --run_version v3 \
   --epochs 150 \
   --views_per_case 6 \
@@ -385,7 +394,6 @@ Stage 3：固定厂家 final_view 协议微调
 
 ```bash
 python -m src.train_phase_c_reconstruction \
-  --data_root data/thorax_fast \
   --phase_a_checkpoint logs/thorax_phaseA_prior_v3/phase_A_best_v3.pth \
   --phase_b_checkpoint logs/thorax_phaseB_projector_v3/phase_B_best_v3.pth \
   --run_version v3 \
@@ -425,7 +433,6 @@ logs/thorax_phaseC_finalview=6_v3/phase_C_epoch=XXXX_v3.pth
 
 ```bash
 python -m src.train_phase_c_reconstruction \
-  --data_root data/thorax_fast \
   --phase_a_checkpoint logs/thorax_phaseA_prior_v3/phase_A_best_v3.pth \
   --phase_b_checkpoint logs/thorax_phaseB_projector_v3/phase_B_best_v3.pth \
   --run_version v3 \
