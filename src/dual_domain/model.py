@@ -27,6 +27,8 @@ class DualDomainReconstructionModel(nn.Module):
         boundary_dim: int = 32,
         prior_feature_channels: int = 32,
         refinement_channels: int = 16,
+        highres_channels: int = 8,
+        checkpoint_highres: bool = True,
         transformer_layers: int = 4,
         projection_seed_size: int = 16,
         output_size: tuple[int, int, int] = (256, 256, 256),
@@ -52,6 +54,8 @@ class DualDomainReconstructionModel(nn.Module):
             prior_feature_channels=prior_feature_channels,
             projection_feature_channels=refinement_channels,
             hidden_channels=24,
+            highres_channels=highres_channels,
+            checkpoint_highres=checkpoint_highres,
             output_size=output_size,
         )
 
@@ -72,6 +76,7 @@ class DualDomainReconstructionModel(nn.Module):
         prior = self.anatomy_prior.decode(
             quantized["anatomy_quantized"],
             quantized["boundary_quantized"],
+            compute_boundary_edge=False,
         )
         refined = self.sculptor(
             prior["base_volume"],
@@ -94,6 +99,10 @@ class DualDomainReconstructionModel(nn.Module):
         """主训练前冻结 CT Encoder/codebook，可选择是否冻结基础解码器。"""
         self.anatomy_prior.freeze_teacher_encoder()
         self.anatomy_prior.freeze_codebooks()
+        for parameter in (
+            self.anatomy_prior.decoder.boundary_edge_head.parameters()
+        ):
+            parameter.requires_grad = False
         if freeze_decoder:
             for parameter in self.anatomy_prior.decoder.parameters():
                 parameter.requires_grad = False
@@ -117,4 +126,3 @@ class DualDomainReconstructionModel(nn.Module):
                 if parameter.requires_grad
             ],
         }
-

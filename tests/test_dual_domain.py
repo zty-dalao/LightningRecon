@@ -12,15 +12,24 @@ import numpy as np
 import torch
 
 from src.dual_domain import (
+    AnatomyPriorLoss,
     DualDomainLoss,
     DualDomainReconstructionModel,
+    HierarchicalAnatomyPrior,
     LearnedForwardProjector,
 )
+from src.dual_domain.losses import DualDomainLossWeights
 from src.thorax_fast_dataset import (
     ThoraxFastDataset,
     resolve_thorax_fast_root,
 )
 from src.train_phase_c_reconstruction import build_schedule, stage_for_epoch
+from src.train_phase_b_projector import (
+    gradient_weight_for_epoch,
+    learning_rate_for_epoch,
+    phase_b_stage,
+    projection_visuals,
+)
 from src.dual_domain.training_utils import (
     accumulation_window_size,
     build_loader,
@@ -123,9 +132,77 @@ class DualDomainModelTest(unittest.TestCase):
         self.assertGreaterEqual(float(outputs["final_volume"].min()), 0.0)
         self.assertLessEqual(float(outputs["final_volume"].max()), 1.0)
         self.assertIn("teacher_anatomy_latent", outputs)
+        self.assertEqual(
+            tuple(outputs["highres_features"].shape),
+            (1, 8, 32, 32, 32),
+        )
+        self.assertEqual(
+            tuple(outputs["residual_logits"].shape),
+            (1, 1, 32, 32, 32),
+        )
 
         losses = DualDomainLoss()(outputs, teacher_ct)
         self.assertTrue(torch.isfinite(losses["total"]))
+        self.assertIn("diagnostic/projection_fraction", losses)
+        self.assertEqual(
+            float(losses["diagnostic/projection_fraction"]), 0.0
+        )
+
+    def test_projection_cycle_weights_are_weak_stage_regularizers(self):
+        expected = {
+            1: (0.004, 0.002),
+            2: (0.0025, 0.00125),
+            3: (0.002, 0.001),
+        }
+        for stage, (input_weight, heldout_weight) in expected.items():
+            weights = getattr(DualDomainLossWeights, f"stage{stage}")()
+            self.assertEqual(weights.input_projection, input_weight)
+            self.assertEqual(weights.heldout_projection, heldout_weight)
+
+    def test_global_anatomy_and_supervised_boundary_shapes(self):
+        prior = HierarchicalAnatomyPrior(
+            anatomy_codebook_size=8,
+            boundary_codebook_size=4,
+            anatomy_dim=8,
+            boundary_dim=4,
+            base_channels=4,
+            prior_feature_channels=4,
+            boundary_residual_blocks=3,
+            anatomy_transformer_layers=2,
+            anatomy_transformer_heads=2,
+            anatomy_context_size=2,
+            boundary_context_channels=2,
+            kmeans_init_batches=1,
+        ).eval()
+        ct = torch.rand(1, 1, 16, 16, 16)
+        with torch.no_grad():
+            outputs = prior(ct, update_codebook=False)
+        self.assertEqual(
+            tuple(outputs["anatomy_latent"].shape), (1, 8, 4, 4, 4)
+        )
+        self.assertEqual(
+            tuple(outputs["boundary_latent"].shape), (1, 4, 8, 8, 8)
+        )
+        self.assertEqual(
+            tuple(outputs["boundary_edge"].shape), (1, 1, 8, 8, 8)
+        )
+        self.assertEqual(len(prior.encoder.anatomy_transformer.layers), 2)
+        losses = AnatomyPriorLoss(boundary_edge_weight=0.05)(outputs, ct)
+        self.assertTrue(torch.isfinite(losses["total"]))
+        self.assertGreater(float(losses["boundary_edge"]), 0.0)
+
+    def test_high_resolution_checkpoint_path_backpropagates(self):
+        model = self._small_model().train()
+        projections = torch.randn(1, 2, 1, 16, 16)
+        angles = torch.tensor([[-np.pi, 0.0]], dtype=torch.float32)
+        outputs = model(projections, angles)
+        self.assertNotIn("boundary_edge", outputs)
+        outputs["final_volume"].mean().backward()
+        gradient = (
+            model.sculptor.highres_refinement[0].block[0].weight.grad
+        )
+        self.assertIsNotNone(gradient)
+        self.assertTrue(torch.isfinite(gradient).all())
 
     def test_forward_projector_preserves_shape_range_and_gradient(self):
         projector = LearnedForwardProjector(
@@ -147,6 +224,50 @@ class DualDomainModelTest(unittest.TestCase):
 
 
 class TrainingEntrypointTest(unittest.TestCase):
+    def test_phase_b_two_stage_lr_and_gradient_schedules(self):
+        args = Namespace(
+            epochs=250,
+            base_epochs=150,
+            lr=1e-4,
+            edge_lr=2e-5,
+            min_lr=1e-6,
+            gradient_weight=0.10,
+            edge_gradient_weight=0.25,
+            edge_gradient_ramp_epochs=25,
+        )
+        self.assertEqual(phase_b_stage(150, args.base_epochs), 1)
+        self.assertEqual(phase_b_stage(151, args.base_epochs), 2)
+        self.assertAlmostEqual(learning_rate_for_epoch(1, args), 1e-4)
+        self.assertAlmostEqual(learning_rate_for_epoch(150, args), 1e-6)
+        self.assertAlmostEqual(learning_rate_for_epoch(151, args), 2e-5)
+        self.assertAlmostEqual(learning_rate_for_epoch(250, args), 1e-6)
+        self.assertAlmostEqual(gradient_weight_for_epoch(150, args), 0.10)
+        self.assertAlmostEqual(gradient_weight_for_epoch(151, args), 0.10)
+        self.assertAlmostEqual(gradient_weight_for_epoch(175, args), 0.25)
+        self.assertAlmostEqual(gradient_weight_for_epoch(250, args), 0.25)
+
+    def test_phase_b_projection_visuals_are_bounded_images(self):
+        prediction = torch.tensor(
+            [[[[[-1.0, 0.0], [0.5, 1.0]]]]], dtype=torch.float32
+        )
+        target = torch.zeros_like(prediction)
+        visuals = projection_visuals(prediction, target)
+        self.assertEqual(
+            set(visuals),
+            {
+                "target",
+                "prediction",
+                "absolute_error",
+                "target_gradient",
+                "prediction_gradient",
+                "gradient_error",
+            },
+        )
+        for image in visuals.values():
+            self.assertEqual(tuple(image.shape), (1, 2, 2))
+            self.assertGreaterEqual(float(image.min()), 0.0)
+            self.assertLessEqual(float(image.max()), 1.0)
+
     def test_kmeans_reservoir_accepts_sub_codebook_batch_chunks(self):
         # 32个reservoir样本分8批收集时，每批只取4个，小于8个码字。
         # 单批不应报错；第8批累计样本充足后才启动K-means。
@@ -211,6 +332,16 @@ class TrainingEntrypointTest(unittest.TestCase):
             final_view = 6
             self.assertEqual(best.name, "phase_C_best_v3.pth")
             self.assertTrue(best.is_file())
+            composite = save_checkpoint(
+                {"epoch": 1},
+                run_dir,
+                phase="B",
+                version="v3",
+                kind="best_composite",
+            )
+            self.assertEqual(
+                composite.name, "phase_B_best_composite_v3.pth"
+            )
             self.assertEqual(final_view, 6)
 
     def test_fixed_final_views_are_selected_from_base_grid(self):

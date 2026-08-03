@@ -189,9 +189,18 @@ src/
 ```text
 CT 256³
   ↓ stride=2
-Boundary latent 128³，32通道
+Boundary local 128³，16通道，3个ResidualBlock
   ↓ stride=2
+Local Anatomy 64³，32通道
+  ↓ stride=2 + AdaptiveAvgPool3D
+Global Anatomy 8³，64通道
+  ↓ 2层全局Transformer，4 heads
+上采样回64³并与Local Anatomy融合
+  ↓
 Anatomy latent 64³，64通道
+Global Anatomy压缩为8通道并回注入Boundary 128³
+  ↓
+Boundary latent 128³，32通道
   ↓
 Anatomy codebook：512×64
 Boundary codebook：256×32
@@ -209,6 +218,10 @@ codebook 直接在真实 CT 域训练，因此比从投影特征学习更接近�
 
 codebook 是局部“词汇表”；三维 latent/token map 决定这些词在当前病例中的
 排列方式。
+
+Anatomy Transformer只处理`8³=512`个token，不直接在`64³`上建立
+`262144×262144`注意力矩阵。Boundary始终保持128³，不继续下采样；其局部
+CNN融合全局Anatomy上下文，并通过独立边缘预测头接受监督。
 
 ### 4.2 稀疏投影编码
 
@@ -252,19 +265,25 @@ Learned Volume Lift：16³
 
 ```python
 base_logits = logit(clamp(x_base))
-refined_logits = base_logits + gate * residual_logits
-final_volume = sigmoid(upsample(refined_logits, 256))
+features_128 = fusion(base_volume, prior_features, projection_features)
+features_128 = conv1x1(features_128, out_channels=8)
+features_256 = depthwise_refine(upsample(features_128, 256))
+residual_logits = residual_head(features_256)
+gate = sigmoid(gate_head(features_256))
+refined_logits = upsample(base_logits, 256) + gate * residual_logits
+final_volume = sigmoid(refined_logits)
 ```
 
-最终输出严格位于 `[0,1]`。大量三维卷积停留在128³，256³只处理单通道
-logits，以控制4090D显存。
+最终输出严格位于 `[0,1]`。主体三维卷积仍停留在128³；最终分辨率保留8通道，
+使用Depthwise 3D卷积和梯度检查点完成轻量细化，再映射为单通道，以兼顾边缘
+表达能力和4090D 24GB显存。
 
 ### 4.4 体素到投影模型
 
 文件：`forward_projector.py`
 
 ```text
-CBCT体素 + 真实角度
+CBCT体素或配准CT体素 + 真实角度
        ↓
 可微旋转与射线方向积分
        ↓
@@ -305,49 +324,76 @@ CBCT体素 + 真实角度
 0.05 × Laplacian
 0.10 × Structural
 0.05 × VQ
+0.05 × Boundary edge auxiliary（按真实边缘强度平衡，避免全零塌缩）
 ```
 
 训练入口：
 
 ```bash
 python -m src.train_phase_a_prior \
-  --run_version v3 \
+  --run_version v4 \
   --epochs 200 \
   --batch_size 1 \
   --grad_accum 4 \
+  --boundary_residual_blocks 3 \
+  --anatomy_transformer_layers 2 \
+  --anatomy_transformer_heads 4 \
+  --anatomy_context_size 8 \
+  --boundary_context_channels 8 \
+  --boundary_edge_weight 0.05 \
   --amp
 ```
 
-日志目录为 `logs/thorax_phaseA_prior_v3/tensorboard`，checkpoint 为：
+新结构必须从头训练Phase A，旧v3 Phase A/Phase C checkpoint不兼容。日志目录为
+`logs/thorax_phaseA_prior_v4/tensorboard`，checkpoint 为：
 
 ```text
-logs/thorax_phaseA_prior_v3/phase_A_best_v3.pth
-logs/thorax_phaseA_prior_v3/phase_A_last_v3.pth
-logs/thorax_phaseA_prior_v3/phase_A_epoch=XXXX_v3.pth
+logs/thorax_phaseA_prior_v4/phase_A_best_v4.pth
+logs/thorax_phaseA_prior_v4/phase_A_last_v4.pth
+logs/thorax_phaseA_prior_v4/phase_A_epoch=XXXX_v4.pth
 ```
 
 ### Phase B：体素到投影模型
 
-使用真实 CBCT、真实角度和真实投影单独训练：
+默认使用真实 CBCT、真实角度和真实投影单独训练。`--volume_source ct`
+可切换到“配准计划CT→真实投影”实验：
 
 - `LearnedForwardProjector`；
 - `ForwardProjectorLoss`。
 
-第一版损失：
+Phase B 采用两阶段损失与学习率计划：
 
 ```text
-1.00 × 投影 Charbonnier
-0.10 × 二维梯度损失
+B1（epoch 1～150）：
+  1.00 × 投影 Charbonnier
+  0.10 × 二维梯度损失
+  learning rate：1e-4 → 1e-6（cosine）
+
+B2（epoch 151～250）：
+  1.00 × 投影 Charbonnier
+  0.10 → 0.25 × 二维梯度损失（前25轮half-cosine平滑增加）
+  learning rate：在epoch 151重启到2e-5，再衰减到1e-6
 ```
 
-投影器必须在独立验证集上合格后冻结。
+B2不是简单延长旧余弦调度器，而是独立的边缘微调阶段。它在保留已学习投影强度的
+同时提高边缘约束，避免从0.10突然跳到0.25造成优化震荡。投影器必须在独立验证集上
+合格后冻结。
 
 训练入口：
 
 ```bash
 python -m src.train_phase_b_projector \
   --run_version v3 \
-  --epochs 150 \
+  --volume_source cbct \
+  --epochs 250 \
+  --base_epochs 150 \
+  --gradient_weight 0.10 \
+  --edge_gradient_weight 0.25 \
+  --edge_gradient_ramp_epochs 25 \
+  --selection_gradient_weight 0.20 \
+  --lr 1e-4 \
+  --edge_lr 2e-5 \
+  --min_lr 1e-6 \
   --views_per_case 6 \
   --projection_size 128 128 \
   --integration_size 96 \
@@ -356,9 +402,54 @@ python -m src.train_phase_b_projector \
   --amp
 ```
 
+CT输入对照实验应使用新的版本号，避免覆盖CBCT基线：
+
+```bash
+python -m src.train_phase_b_projector \
+  --run_version v4 \
+  --volume_source ct \
+  --epochs 250 --base_epochs 150 \
+  --views_per_case 6 \
+  --amp
+```
+
+真实投影属于CBCT采集时刻，因此CT版本不是纯粹的理想物理投影器；它同时学习
+刚性配准残差、CT/CBCT域差异与实测噪声。它与Phase C的CT风格输出更一致，
+但也可能被呼吸、解剖变化和配准误差限制，必须与CBCT版本做同数据划分的消融对比。
+
+已有150轮Phase B checkpoint时，使用相同`run_version`恢复；代码会忽略旧checkpoint
+中的`T_max=150`调度状态，在epoch 151自动重启B2学习率：
+
+```bash
+python -m src.train_phase_b_projector \
+  --run_version v3 \
+  --epochs 250 \
+  --base_epochs 150 \
+  --resume logs/thorax_phaseB_projector_v3/phase_B_last_v3.pth \
+  --amp
+```
+
 训练集每次读取随机选择真实角度，验证集固定为均匀角度。日志目录为
-`logs/thorax_phaseB_projector_v3/tensorboard`，最佳模型为
-`logs/thorax_phaseB_projector_v3/phase_B_best_v3.pth`。
+`logs/thorax_phaseB_projector_v3/tensorboard`。checkpoint包括：
+
+```text
+phase_B_best_psnr_v3.pth       # Val/psnr最高
+phase_B_best_edge_v3.pth       # Val/gradient最低，仅用于边缘诊断
+phase_B_best_composite_v3.pth  # Val/image + 0.20×Val/gradient最低，Phase C推荐
+phase_B_best_v3.pth            # best_composite的向后兼容别名
+phase_B_last_v3.pth
+phase_B_epoch=XXXX_v3.pth
+```
+
+新增TensorBoard指标：
+
+- `Train/Stage`：B1或B2；
+- `Train/gradient_weight`：当前动态梯度系数；
+- `Val/image`、`Val/gradient`：验证集原始分项；
+- `Val/composite`：固定使用`image + 0.20×gradient`，可跨B1/B2比较；
+- `ValImages/*`：固定验证病例/角度的真实投影、预测投影、强度误差、梯度图和梯度误差图。
+
+`Val/loss`使用当前训练系数，因此B2系数变化时不能单独用于跨阶段checkpoint比较。
 
 ### Phase C：主重建模型
 
@@ -387,21 +478,35 @@ Stage 3：固定厂家 final_view 协议微调
 - 输入视角投影闭环；
 - 随机隐藏视角投影闭环。
 
+投影闭环只作为弱物理正则，CT图像、结构、边缘、基础体积和latent监督仍是主体。
+根据既有日志的raw loss量级，三阶段权重校准为：
+
+| 阶段 | input projection | held-out projection | 预期投影总贡献 |
+|---|---:|---:|---:|
+| Stage 1 | 0.004 | 0.002 | 约5%（高视角时held-out可能为空） |
+| Stage 2 | 0.0025 | 0.00125 | 约5% |
+| Stage 3 | 0.002 | 0.001 | 约5% |
+
+raw loss会随模型和数据变化，故“5%”不是仅由固定系数保证。TensorBoard中的
+`Train/Loss/diagnostic/projection_fraction`和`Val/projection_fraction`
+记录每个batch/验证集的真实加权贡献比例；若长期偏离5%，再按新实验尺度微调系数。
+
 投影器参数应冻结，但其前向不能放在 `torch.no_grad()` 中，否则投影损失
 无法穿过投影器更新重建体积。
 
-训练入口（以最终 6-view、v3 为例）：
+训练入口（以最终 6-view、新结构v4为例）：
 
 ```bash
 python -m src.train_phase_c_reconstruction \
-  --phase_a_checkpoint logs/thorax_phaseA_prior_v3/phase_A_best_v3.pth \
-  --phase_b_checkpoint logs/thorax_phaseB_projector_v3/phase_B_best_v3.pth \
-  --run_version v3 \
+  --phase_a_checkpoint logs/thorax_phaseA_prior_v4/phase_A_best_v4.pth \
+  --phase_b_checkpoint logs/thorax_phaseB_projector_v3/phase_B_best_composite_v3.pth \
+  --run_version v4 \
   --final_view 6 \
   --stage1_epochs 150 \
   --stage2_epochs_per_view 30 \
   --stage3_epochs 100 \
   --projection_size 128 128 \
+  --highres_channels 8 \
   --batch_size 1 \
   --grad_accum 4 \
   --amp
@@ -423,28 +528,29 @@ final_view=10：60→50→40→30→20→10
 Phase C 日志目录及 checkpoint：
 
 ```text
-logs/thorax_phaseC_finalview=6_v3/tensorboard
-logs/thorax_phaseC_finalview=6_v3/phase_C_best_v3.pth
-logs/thorax_phaseC_finalview=6_v3/phase_C_last_v3.pth
-logs/thorax_phaseC_finalview=6_v3/phase_C_epoch=XXXX_v3.pth
+logs/thorax_phaseC_finalview=6_v4/tensorboard
+logs/thorax_phaseC_finalview=6_v4/phase_C_best_v4.pth
+logs/thorax_phaseC_finalview=6_v4/phase_C_last_v4.pth
+logs/thorax_phaseC_finalview=6_v4/phase_C_epoch=XXXX_v4.pth
 ```
 
 完整断点续训使用相应入口的 `--resume`，并保持其它结构和课程参数不变：
 
 ```bash
 python -m src.train_phase_c_reconstruction \
-  --phase_a_checkpoint logs/thorax_phaseA_prior_v3/phase_A_best_v3.pth \
-  --phase_b_checkpoint logs/thorax_phaseB_projector_v3/phase_B_best_v3.pth \
-  --run_version v3 \
+  --phase_a_checkpoint logs/thorax_phaseA_prior_v4/phase_A_best_v4.pth \
+  --phase_b_checkpoint logs/thorax_phaseB_projector_v3/phase_B_best_composite_v3.pth \
+  --run_version v4 \
   --final_view 6 \
-  --resume logs/thorax_phaseC_finalview=6_v3/phase_C_last_v3.pth
+  --highres_channels 8 \
+  --resume logs/thorax_phaseC_finalview=6_v4/phase_C_last_v4.pth
 ```
 
-同时查看同一版本的三个 TensorBoard：
+同时查看新结构对应的三个 TensorBoard（Phase B结构未变，因此复用v3）：
 
 ```bash
 tensorboard --logdir_spec \
-phaseA_v3:logs/thorax_phaseA_prior_v3/tensorboard,phaseB_v3:logs/thorax_phaseB_projector_v3/tensorboard,phaseC_6view_v3:logs/thorax_phaseC_finalview=6_v3/tensorboard \
+phaseA_v4:logs/thorax_phaseA_prior_v4/tensorboard,phaseB_v3:logs/thorax_phaseB_projector_v3/tensorboard,phaseC_6view_v4:logs/thorax_phaseC_finalview=6_v4/tensorboard \
 --port 6006
 ```
 
@@ -482,6 +588,8 @@ reprojected = frozen_projector(volume_256, angles)
 ```text
 Train/Loss/*
 Train/LearningRate/*
+Train/boundary_edge
+Train/weighted_boundary_edge
 Codebook/anatomy_normalized_perplexity
 Codebook/anatomy_batch_active_fraction
 Codebook/anatomy_ema_active_fraction
@@ -491,10 +599,12 @@ Codebook/boundary_ema_active_fraction
 Val/base_psnr
 Val/final_psnr
 Val/final_ssim
+Val/boundary_edge
 Sculptor/residual_abs_mean
 Sculptor/gate_mean
 Val/input_cycle
 Val/heldout_cycle
+Val/projection_fraction
 ```
 
 图像诊断应同时显示相同病例、相同切片的：
@@ -528,7 +638,7 @@ gate
 验证结果：
 
 ```text
-主重建模型参数：1,136,235
+主重建模型参数：1,884,196
 前向投影器参数：48,833
 单元测试：3项新架构测试全部通过
 ```

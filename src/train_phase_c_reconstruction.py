@@ -45,7 +45,7 @@ from src.view_protocol import resolve_view_curriculum
 
 
 PHASE = "C"
-CHECKPOINT_FORMAT = 1
+CHECKPOINT_FORMAT = 2
 
 
 def build_schedule(args) -> list[tuple[int, int, int, int]]:
@@ -94,6 +94,12 @@ def configure_optimizer(
     prior_decoder_trainable = stage != 3
     for parameter in model.anatomy_prior.decoder.parameters():
         parameter.requires_grad = prior_decoder_trainable
+    # Boundary边缘辅助头只服务Phase A；Phase C不执行它，因此Stage 1/2
+    # 解冻其余Prior Decoder时也不能把该无梯度分支重新加入优化器。
+    for parameter in (
+        model.anatomy_prior.decoder.boundary_edge_head.parameters()
+    ):
+        parameter.requires_grad = False
 
     if stage == 1:
         lrs = {
@@ -129,6 +135,11 @@ def _load_phase_a_prior(checkpoint: dict) -> HierarchicalAnatomyPrior:
     if checkpoint.get("phase") != "A":
         raise ValueError("--phase_a_checkpoint 不是 Phase A checkpoint")
     config = checkpoint["model_config"]
+    if int(config.get("architecture_version", 1)) != 2:
+        raise ValueError(
+            "Phase A checkpoint uses the legacy prior architecture; retrain "
+            "Phase A with the global Anatomy Transformer and Boundary v2"
+        )
     prior = HierarchicalAnatomyPrior(
         anatomy_codebook_size=int(config["anatomy_codebook_size"]),
         boundary_codebook_size=int(config["boundary_codebook_size"]),
@@ -137,6 +148,13 @@ def _load_phase_a_prior(checkpoint: dict) -> HierarchicalAnatomyPrior:
         base_channels=int(config["base_channels"]),
         prior_feature_channels=int(config["prior_feature_channels"]),
         kmeans_init_batches=int(config["kmeans_init_batches"]),
+        boundary_residual_blocks=int(config["boundary_residual_blocks"]),
+        anatomy_transformer_layers=int(
+            config["anatomy_transformer_layers"]
+        ),
+        anatomy_transformer_heads=int(config["anatomy_transformer_heads"]),
+        anatomy_context_size=int(config["anatomy_context_size"]),
+        boundary_context_channels=int(config["boundary_context_channels"]),
     )
     prior.load_state_dict(checkpoint["model_state"])
     if not (
@@ -188,6 +206,8 @@ def build_model(
         boundary_dim=int(config["boundary_dim"]),
         prior_feature_channels=int(config["prior_feature_channels"]),
         refinement_channels=args.refinement_channels,
+        highres_channels=args.highres_channels,
+        checkpoint_highres=args.checkpoint_highres,
         transformer_layers=args.transformer_layers,
         projection_seed_size=16,
         output_size=(256, 256, 256),
@@ -235,6 +255,7 @@ def evaluate(
         "ssim": 0.0,
         "input_cycle": 0.0,
         "heldout_cycle": 0.0,
+        "projection_fraction": 0.0,
     }
     cases = 0
     for batch in loader:
@@ -300,6 +321,9 @@ def evaluate(
         sums["heldout_cycle"] += (
             float(losses["raw/heldout_projection"]) * batch_size
         )
+        sums["projection_fraction"] += (
+            float(losses["diagnostic/projection_fraction"]) * batch_size
+        )
 
     result = {
         key: value / cases
@@ -326,6 +350,7 @@ def build_payload(
     validation: dict | None,
     phase_a_model_config: dict,
     phase_b_model_config: dict,
+    phase_b_data_config: dict,
     train_loader,
 ) -> dict:
     return {
@@ -356,12 +381,15 @@ def build_payload(
             "phase_b_checkpoint": str(
                 Path(args.phase_b_checkpoint).resolve()
             ),
+            "phase_b_data_config": phase_b_data_config,
         },
         "model_config": {
             "anatomy_prior": phase_a_model_config,
             "forward_projector": phase_b_model_config,
             "transformer_layers": args.transformer_layers,
             "refinement_channels": args.refinement_channels,
+            "highres_channels": args.highres_channels,
+            "checkpoint_highres": args.checkpoint_highres,
             "projection_seed_size": 16,
             "projection_size": list(args.projection_size),
             "output_size": [256, 256, 256],
@@ -384,6 +412,7 @@ def train(args) -> None:
     )
     if (
         min(positive) <= 0
+        or args.highres_channels <= 0
         or args.stage3_epochs < 0
         or args.heldout_cycle_views < 0
         or args.num_workers < 0
@@ -474,6 +503,11 @@ def train(args) -> None:
         resume_checkpoint = load_trusted_checkpoint(args.resume, device)
         if resume_checkpoint.get("phase") != PHASE:
             raise ValueError("resume checkpoint 不是 Phase C")
+        if int(resume_checkpoint.get("checkpoint_format", 1)) != 2:
+            raise ValueError(
+                "该 Phase C checkpoint 使用旧的单通道上采样结构，不能恢复到 "
+                "8通道高分辨率细化模型"
+            )
         if resume_checkpoint.get("run_version") != args.run_version:
             raise ValueError("resume run_version 与当前命令不一致")
         if int(resume_checkpoint["final_view"]) != args.final_view:
@@ -523,6 +557,10 @@ def train(args) -> None:
                 "- Stage 3: `fixed manufacturer final-view subset`",
                 "- codebooks: `frozen CT-domain EMA`",
                 "- forward_projector: `frozen parameters, gradient to volume enabled`",
+                "- forward_projector_volume_source: "
+                f"`{phase_b_checkpoint.get('data_config', {}).get('volume_source', 'cbct')}`",
+                f"- high_resolution_refinement: `{args.highres_channels} channels at 256^3`",
+                f"- checkpoint_highres: `{args.checkpoint_highres}`",
             ]
         ),
         0,
@@ -719,6 +757,9 @@ def train(args) -> None:
                     phase_b_model_config=phase_b_checkpoint[
                         "model_config"
                     ],
+                    phase_b_data_config=phase_b_checkpoint.get(
+                        "data_config", {"volume_source": "cbct"}
+                    ),
                     train_loader=train_loader,
                 )
                 save_checkpoint(
@@ -750,6 +791,9 @@ def train(args) -> None:
             validation=validation,
             phase_a_model_config=phase_a_checkpoint["model_config"],
             phase_b_model_config=phase_b_checkpoint["model_config"],
+            phase_b_data_config=phase_b_checkpoint.get(
+                "data_config", {"volume_source": "cbct"}
+            ),
             train_loader=train_loader,
         )
         save_checkpoint(
@@ -839,6 +883,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--transformer_layers", type=int, default=4)
     parser.add_argument("--refinement_channels", type=int, default=16)
+    parser.add_argument("--highres_channels", type=int, default=8)
+    parser.add_argument(
+        "--checkpoint_highres",
+        action="store_true",
+        default=True,
+    )
+    parser.add_argument(
+        "--no_checkpoint_highres",
+        action="store_false",
+        dest="checkpoint_highres",
+    )
     parser.add_argument(
         "--projection_size", type=int, nargs=2, default=(128, 128)
     )

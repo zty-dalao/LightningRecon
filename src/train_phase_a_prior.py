@@ -37,7 +37,7 @@ from src.thorax_fast_dataset import (
 
 
 PHASE = "A"
-CHECKPOINT_FORMAT = 1
+CHECKPOINT_FORMAT = 2
 
 
 @torch.no_grad()
@@ -111,6 +111,7 @@ def evaluate(
     model.eval()
     sums = {
         "loss": 0.0,
+        "boundary_edge": 0.0,
         "psnr": 0.0,
         "ssim": 0.0,
     }
@@ -131,11 +132,15 @@ def evaluate(
         )
         batch_size = ct.shape[0]
         sums["loss"] += float(losses["total"]) * batch_size
+        sums["boundary_edge"] += (
+            float(losses["boundary_edge"]) * batch_size
+        )
         sums["psnr"] += metrics["psnr_sum"]
         sums["ssim"] += metrics.get("ssim_sum", 0.0)
         cases += batch_size
     result = {
         "loss": sums["loss"] / cases,
+        "boundary_edge": sums["boundary_edge"] / cases,
         "psnr": sums["psnr"] / cases,
     }
     if compute_ssim:
@@ -173,6 +178,7 @@ def build_payload(
         "validation": validation,
         "run_version": args.run_version,
         "model_config": {
+            "architecture_version": 2,
             "anatomy_codebook_size": args.anatomy_codebook_size,
             "boundary_codebook_size": args.boundary_codebook_size,
             "anatomy_dim": args.anatomy_dim,
@@ -180,6 +186,14 @@ def build_payload(
             "base_channels": args.base_channels,
             "prior_feature_channels": args.prior_feature_channels,
             "kmeans_init_batches": args.kmeans_init_batches,
+            "boundary_residual_blocks": args.boundary_residual_blocks,
+            "anatomy_transformer_layers": (
+                args.anatomy_transformer_layers
+            ),
+            "anatomy_transformer_heads": args.anatomy_transformer_heads,
+            "anatomy_context_size": args.anatomy_context_size,
+            "boundary_context_channels": args.boundary_context_channels,
+            "boundary_edge_weight": args.boundary_edge_weight,
         },
         "data_config": {
             "volume_size": [256, 256, 256],
@@ -205,6 +219,8 @@ def train(args) -> None:
         )
     if args.num_workers < 0:
         raise ValueError("num_workers 不能为负数")
+    if args.boundary_edge_weight < 0.0:
+        raise ValueError("boundary_edge_weight cannot be negative")
     set_global_seed(args.seed, args.deterministic)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = bool(args.amp and device.type == "cuda")
@@ -251,8 +267,15 @@ def train(args) -> None:
         base_channels=args.base_channels,
         prior_feature_channels=args.prior_feature_channels,
         kmeans_init_batches=args.kmeans_init_batches,
+        boundary_residual_blocks=args.boundary_residual_blocks,
+        anatomy_transformer_layers=args.anatomy_transformer_layers,
+        anatomy_transformer_heads=args.anatomy_transformer_heads,
+        anatomy_context_size=args.anatomy_context_size,
+        boundary_context_channels=args.boundary_context_channels,
     ).to(device)
-    criterion = AnatomyPriorLoss()
+    criterion = AnatomyPriorLoss(
+        boundary_edge_weight=args.boundary_edge_weight
+    )
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
@@ -268,6 +291,15 @@ def train(args) -> None:
             raise ValueError("resume checkpoint 不是 Phase A")
         if checkpoint.get("run_version") != args.run_version:
             raise ValueError("resume run_version 与当前命令不一致")
+        if int(
+            checkpoint.get("model_config", {}).get(
+                "architecture_version", 1
+            )
+        ) != 2:
+            raise ValueError(
+                "该 Phase A checkpoint 来自旧解剖先验结构；新增全局 "
+                "Transformer/Boundary 分支后必须重新训练 Phase A"
+            )
         model.load_state_dict(checkpoint["model_state"])
         optimizer.load_state_dict(checkpoint["optimizer_state"])
         scheduler.load_state_dict(checkpoint["scheduler_state"])
@@ -311,6 +343,14 @@ def train(args) -> None:
                 f"- val_cases: `{len(val_set)}`",
                 "- target: `clean pCT [0,1]`",
                 "- output: `128^3 base volume`",
+                "- anatomy_global_context: "
+                f"`{args.anatomy_context_size}^3 tokens, "
+                f"{args.anatomy_transformer_layers} layers, "
+                f"{args.anatomy_transformer_heads} heads`",
+                "- boundary: "
+                f"`{args.boundary_residual_blocks} local residual blocks "
+                "+ global context`",
+                f"- boundary_edge_weight: `{args.boundary_edge_weight}`",
             ]
         ),
         0,
@@ -469,6 +509,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--boundary_dim", type=int, default=32)
     parser.add_argument("--base_channels", type=int, default=16)
     parser.add_argument("--prior_feature_channels", type=int, default=32)
+    parser.add_argument(
+        "--boundary_residual_blocks", type=int, default=3
+    )
+    parser.add_argument(
+        "--anatomy_transformer_layers", type=int, default=2
+    )
+    parser.add_argument(
+        "--anatomy_transformer_heads", type=int, default=4
+    )
+    parser.add_argument("--anatomy_context_size", type=int, default=8)
+    parser.add_argument(
+        "--boundary_context_channels", type=int, default=8
+    )
+    parser.add_argument("--boundary_edge_weight", type=float, default=0.05)
     parser.add_argument("--kmeans_init_batches", type=int, default=8)
     parser.add_argument("--eval_every", type=int, default=5)
     parser.add_argument("--save_every", type=int, default=25)

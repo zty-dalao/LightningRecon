@@ -160,12 +160,18 @@ def save_checkpoint(
     kind: str,
     epoch: int | None = None,
 ) -> Path:
-    """以 phase/version 命名保存 best、last 或周期 checkpoint。"""
+    """保存通用/分指标 best、last 或周期 checkpoint。"""
     if kind == "epoch":
         if epoch is None:
             raise ValueError("周期 checkpoint 必须提供 epoch")
         name = f"phase_{phase}_epoch={epoch:04d}_{version}.pth"
-    elif kind in {"best", "last"}:
+    elif kind in {
+        "best",
+        "best_psnr",
+        "best_edge",
+        "best_composite",
+        "last",
+    }:
         name = f"phase_{phase}_{kind}_{version}.pth"
     else:
         raise ValueError(f"不支持的 checkpoint kind={kind!r}")

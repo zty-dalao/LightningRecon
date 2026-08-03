@@ -26,8 +26,10 @@ class DualDomainLossWeights:
     latent_distillation: float = 0.10
     residual_regularization: float = 0.01
     vq: float = 0.0
-    input_projection: float = 0.10
-    heldout_projection: float = 0.05
+    # 投影闭环只作为弱物理正则。默认值对应 Stage 2；各阶段根据历史
+    # raw loss 的量级单独校准，使两项投影损失合计约占 total 的 5%。
+    input_projection: float = 0.0025
+    heldout_projection: float = 0.00125
 
     @classmethod
     def stage1(cls) -> "DualDomainLossWeights":
@@ -36,8 +38,8 @@ class DualDomainLossWeights:
             base_image=0.30,
             latent_distillation=0.20,
             residual_regularization=0.02,
-            input_projection=0.05,
-            heldout_projection=0.02,
+            input_projection=0.004,
+            heldout_projection=0.002,
         )
 
     @classmethod
@@ -49,8 +51,8 @@ class DualDomainLossWeights:
             base_image=0.20,
             latent_distillation=0.10,
             residual_regularization=0.01,
-            input_projection=0.10,
-            heldout_projection=0.05,
+            input_projection=0.0025,
+            heldout_projection=0.00125,
         )
 
     @classmethod
@@ -62,8 +64,8 @@ class DualDomainLossWeights:
             base_image=0.10,
             latent_distillation=0.05,
             residual_regularization=0.005,
-            input_projection=0.10,
-            heldout_projection=0.05,
+            input_projection=0.002,
+            heldout_projection=0.001,
         )
 
 
@@ -76,12 +78,46 @@ class AnatomyPriorLoss(nn.Module):
         laplacian_weight: float = 0.05,
         structural_weight: float = 0.10,
         vq_weight: float = 0.05,
+        boundary_edge_weight: float = 0.05,
     ):
         super().__init__()
         self.image_weight = float(image_weight)
         self.laplacian_weight = float(laplacian_weight)
         self.structural_weight = float(structural_weight)
         self.vq_weight = float(vq_weight)
+        self.boundary_edge_weight = float(boundary_edge_weight)
+        if self.boundary_edge_weight < 0.0:
+            raise ValueError("boundary_edge_weight cannot be negative")
+
+    @staticmethod
+    def _edge_magnitude(volume: torch.Tensor) -> torch.Tensor:
+        """计算三个方向的平均绝对一阶差分，并保持输入形状。"""
+        grad_d = F.pad(
+            (volume[:, :, 1:] - volume[:, :, :-1]).abs(),
+            (0, 0, 0, 0, 0, 1),
+        )
+        grad_h = F.pad(
+            (volume[:, :, :, 1:] - volume[:, :, :, :-1]).abs(),
+            (0, 0, 0, 1, 0, 0),
+        )
+        grad_w = F.pad(
+            (volume[:, :, :, :, 1:] - volume[:, :, :, :, :-1]).abs(),
+            (0, 1, 0, 0, 0, 0),
+        )
+        return (grad_d + grad_h + grad_w) / 3.0
+
+    @staticmethod
+    def _balanced_edge_loss(
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        eps: float = 1e-3,
+    ) -> torch.Tensor:
+        """平衡稀疏真实边缘，避免辅助头退化为全零预测。"""
+        spatial_dims = tuple(range(2, target.ndim))
+        mean_edge = target.mean(dim=spatial_dims, keepdim=True).clamp_min(1e-4)
+        weights = (1.0 + 4.0 * target / mean_edge).clamp(max=10.0)
+        robust_error = torch.sqrt((prediction - target).square() + eps**2)
+        return (weights * robust_error).sum() / weights.sum().clamp_min(1.0)
 
     def forward(
         self, outputs: dict[str, torch.Tensor], target_ct: torch.Tensor
@@ -97,11 +133,17 @@ class AnatomyPriorLoss(nn.Module):
         laplacian = laplacian_pyramid_loss(base, target)
         structure = structural_loss(base, target)
         vq = outputs["vq_loss"]
+        if "boundary_edge" not in outputs:
+            raise KeyError("Phase A outputs are missing boundary_edge")
+        boundary_edge = self._balanced_edge_loss(
+            outputs["boundary_edge"], self._edge_magnitude(target)
+        )
         total = (
             self.image_weight * image
             + self.laplacian_weight * laplacian
             + self.structural_weight * structure
             + self.vq_weight * vq
+            + self.boundary_edge_weight * boundary_edge
         )
         return {
             "total": total,
@@ -109,6 +151,10 @@ class AnatomyPriorLoss(nn.Module):
             "laplacian": laplacian,
             "structural": structure,
             "vq": vq,
+            "boundary_edge": boundary_edge,
+            "weighted_boundary_edge": (
+                self.boundary_edge_weight * boundary_edge
+            ),
         }
 
 
@@ -224,11 +270,23 @@ class DualDomainLoss(nn.Module):
         }
         total = sum(weighted.values())
 
+        # 系数只能给出预期占比，raw loss 会随训练变化，因此直接记录每个
+        # batch 中投影项对 total 的真实贡献。detach 避免诊断量参与反传。
+        projection_weighted = (
+            weighted["input_projection"]
+            + weighted["heldout_projection"]
+        )
+        projection_fraction = (
+            projection_weighted.detach()
+            / total.detach().abs().clamp_min(1e-12)
+        )
+
         result = {"total": total}
         result.update({f"raw/{name}": value for name, value in raw.items()})
         result.update(
             {f"weighted/{name}": value for name, value in weighted.items()}
         )
+        result["diagnostic/projection_fraction"] = projection_fraction
         return result
 
 
@@ -242,7 +300,14 @@ class ForwardProjectorLoss(nn.Module):
     ):
         super().__init__()
         self.image_weight = float(image_weight)
-        self.gradient_weight = float(gradient_weight)
+        self.set_gradient_weight(gradient_weight)
+
+    def set_gradient_weight(self, gradient_weight: float) -> None:
+        """Update the Phase B edge coefficient with basic validation."""
+        gradient_weight = float(gradient_weight)
+        if gradient_weight < 0.0:
+            raise ValueError("gradient_weight must be non-negative")
+        self.gradient_weight = gradient_weight
 
     @staticmethod
     def _gradient_loss(

@@ -103,6 +103,30 @@ class ResidualBlock3D(nn.Module):
         return F.silu(x + self.conv2(self.conv1(x)), inplace=True)
 
 
+class DepthwiseSeparableResidualBlock3D(nn.Module):
+    """面向稠密高分辨率体积的低显存深度可分离三维残差块。"""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv3d(
+                channels,
+                channels,
+                kernel_size=3,
+                padding=1,
+                groups=channels,
+                bias=False,
+            ),
+            nn.GroupNorm(_group_count(channels), channels),
+            nn.SiLU(inplace=True),
+            nn.Conv3d(channels, channels, kernel_size=1, bias=False),
+            nn.GroupNorm(_group_count(channels), channels),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.silu(x + self.block(x), inplace=True)
+
+
 class DownBlock3D(nn.Module):
     """使用 stride=2 将三维边长减半。"""
 
@@ -153,4 +177,3 @@ class AngleEmbedding(nn.Module):
             (torch.sin(angles), torch.cos(angles)), dim=-1
         )
         return self.network(angle_features)
-

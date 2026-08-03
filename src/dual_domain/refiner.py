@@ -5,15 +5,20 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
-from .blocks import ConvNormAct3D, ResidualBlock3D
+from .blocks import (
+    ConvNormAct3D,
+    DepthwiseSeparableResidualBlock3D,
+    ResidualBlock3D,
+)
 
 
 class ResidualVolumeSculptor(nn.Module):
-    """预测 1/2 分辨率 residual/gate，再轻量生成最终 256³ 体积。
+    """在128³融合语义，并以8通道Depthwise 3D块细化256³输出。
 
-    大部分卷积停留在 128³；最终 256³ 只保存单通道 logits/volume，
-    避免在高分辨率上维持大量三维特征。
+    昂贵的语义主干仍停留在128³；最终分辨率只运行紧凑的深度可分离卷积，
+    并可通过梯度检查点控制24GB显存下的训练峰值。
     """
 
     def __init__(
@@ -21,10 +26,15 @@ class ResidualVolumeSculptor(nn.Module):
         prior_feature_channels: int = 32,
         projection_feature_channels: int = 16,
         hidden_channels: int = 24,
+        highres_channels: int = 8,
+        checkpoint_highres: bool = True,
         output_size: tuple[int, int, int] = (256, 256, 256),
     ):
         super().__init__()
         self.output_size = tuple(int(v) for v in output_size)
+        if highres_channels < 1:
+            raise ValueError("highres_channels must be positive")
+        self.checkpoint_highres = bool(checkpoint_highres)
         in_channels = (
             1 + prior_feature_channels + projection_feature_channels
         )
@@ -33,8 +43,16 @@ class ResidualVolumeSculptor(nn.Module):
             ResidualBlock3D(hidden_channels),
             ResidualBlock3D(hidden_channels),
         )
-        self.residual_head = nn.Conv3d(hidden_channels, 1, kernel_size=1)
-        self.gate_head = nn.Conv3d(hidden_channels, 1, kernel_size=1)
+        self.highres_seed = ConvNormAct3D(
+            hidden_channels, highres_channels, kernel_size=1
+        )
+        self.highres_refinement = nn.Sequential(
+            DepthwiseSeparableResidualBlock3D(highres_channels),
+        )
+        self.residual_head = nn.Conv3d(
+            highres_channels, 1, kernel_size=1
+        )
+        self.gate_head = nn.Conv3d(highres_channels, 1, kernel_size=1)
 
     def forward(
         self,
@@ -53,19 +71,35 @@ class ResidualVolumeSculptor(nn.Module):
                 (base_volume, prior_features, projection_features), dim=1
             )
         )
-        residual_logits = self.residual_head(fused)
-        gate = torch.sigmoid(self.gate_head(fused))
-
-        # 在 logit 空间雕刻可保证最终 sigmoid 输出严格位于 [0,1]。
-        base_logits = torch.logit(base_volume.clamp(1e-4, 1.0 - 1e-4))
-        refined_logits = base_logits + gate * residual_logits
-        final_logits = F.interpolate(
-            refined_logits,
+        highres = self.highres_seed(fused)
+        highres = F.interpolate(
+            highres,
             size=self.output_size,
             mode="trilinear",
             align_corners=False,
         )
-        final_volume = torch.sigmoid(final_logits)
+        if self.checkpoint_highres and self.training:
+            highres = checkpoint(
+                self.highres_refinement,
+                highres,
+                use_reentrant=False,
+            )
+        else:
+            highres = self.highres_refinement(highres)
+        residual_logits = self.residual_head(highres)
+        gate = torch.sigmoid(self.gate_head(highres))
+
+        # Sculpt directly in the final-resolution logit space.  The old path
+        # predicted one 128^3 channel and could only trilinearly interpolate it.
+        base_logits = torch.logit(base_volume.clamp(1e-4, 1.0 - 1e-4))
+        base_logits_full = F.interpolate(
+            base_logits,
+            size=self.output_size,
+            mode="trilinear",
+            align_corners=False,
+        )
+        refined_logits = base_logits_full + gate * residual_logits
+        final_volume = torch.sigmoid(refined_logits)
         base_volume_full = F.interpolate(
             base_volume,
             size=self.output_size,
@@ -76,7 +110,7 @@ class ResidualVolumeSculptor(nn.Module):
             "residual_logits": residual_logits,
             "gate": gate,
             "refined_logits": refined_logits,
+            "highres_features": highres,
             "base_volume_full": base_volume_full,
             "final_volume": final_volume,
         }
-
