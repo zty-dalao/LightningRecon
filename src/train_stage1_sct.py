@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 
 import torch
 from torch.utils.tensorboard import SummaryWriter
@@ -19,16 +18,10 @@ from src.fast_sculpt import BaseSCTLoss, BaseSCTNet
 from src.thorax_fast_dataset import ThoraxFastDataset
 
 
-@dataclass
-class EpochResult:
-    loss: float
-    psnr: float
-
-
 def _run_epoch(model, loader, loss_fn, device, optimizer=None, scaler=None):
     training = optimizer is not None
     model.train(training)
-    loss_sum = psnr_sum = 0.0
+    sums = {"Loss/total": 0.0, "Metrics/PSNR": 0.0}
     cases = 0
     for batch in loader:
         cbct = batch["cbct"].to(device, non_blocking=True)
@@ -49,12 +42,18 @@ def _run_epoch(model, loader, loss_fn, device, optimizer=None, scaler=None):
             scaler.step(optimizer)
             scaler.update()
         batch_size = cbct.shape[0]
-        loss_sum += float(losses["total"].detach()) * batch_size
-        psnr_sum += float(volume_psnr_per_case(
+        sums["Loss/total"] += float(losses["total"].detach()) * batch_size
+        sums["Metrics/PSNR"] += float(volume_psnr_per_case(
             outputs["base_sct"].detach(), ct
         ).sum())
+        # 同时记录未加权数值和乘系数后的真实贡献，便于判断某项损失
+        # 是否因为量纲不同而实际主导total loss。
+        for group in ("raw", "weighted"):
+            for name, value in losses[group].items():
+                key = f"Loss/{group}/{name}"
+                sums[key] = sums.get(key, 0.0) + float(value.detach()) * batch_size
         cases += batch_size
-    return EpochResult(loss_sum / cases, psnr_sum / cases)
+    return {key: value / cases for key, value in sums.items()}
 
 
 def train(args):
@@ -115,26 +114,28 @@ def train(args):
                 model, val_loader, loss_fn, device, scaler=scaler
             )
         scheduler.step()
-        writer.add_scalar("Train/Loss", train_result.loss, epoch)
-        writer.add_scalar("Train/PSNR", train_result.psnr, epoch)
-        writer.add_scalar("Val/Loss", val_result.loss, epoch)
-        writer.add_scalar("Val/PSNR", val_result.psnr, epoch)
-        writer.add_scalar("Train/LR", optimizer.param_groups[0]["lr"], epoch)
+        for key, value in train_result.items():
+            writer.add_scalar(f"Train/{key}", value, epoch)
+        for key, value in val_result.items():
+            writer.add_scalar(f"Val/{key}", value, epoch)
+        writer.add_scalar("Train/Optimizer/LR", optimizer.param_groups[0]["lr"], epoch)
+        val_psnr = val_result["Metrics/PSNR"]
         payload = {
             "model": model.state_dict(), "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(), "scaler": scaler.state_dict(),
-            "epoch": epoch, "best_psnr": max(best_psnr, val_result.psnr),
+            "epoch": epoch, "best_psnr": max(best_psnr, val_psnr),
             "model_config": {"base_channels": args.base_channels},
             "args": vars(args),
         }
         torch.save(payload, run_dir / "stage1_last.pth")
-        if val_result.psnr > best_psnr:
-            best_psnr = val_result.psnr
+        if val_psnr > best_psnr:
+            best_psnr = val_psnr
             torch.save(payload, run_dir / "stage1_best.pth")
         print(
             f"[Stage1 {epoch + 1:03d}/{args.epochs}] "
-            f"train={train_result.loss:.5f} val={val_result.loss:.5f} "
-            f"PSNR={val_result.psnr:.2f}dB"
+            f"train={train_result['Loss/total']:.5f} "
+            f"val={val_result['Loss/total']:.5f} "
+            f"PSNR={val_psnr:.2f}dB"
         )
     writer.close()
 

@@ -99,6 +99,22 @@ python -m src.train_stage1_sct \
 根据验证集PSNR保存`stage1_best.pth`，每轮覆盖保存完整`stage1_last.pth`。测试集不
 参与checkpoint选择。
 
+Stage 1日志目录为：
+
+```text
+logs/stage1_sct_{run_version}
+```
+
+例如`--run_version v5`时启动TensorBoard：
+
+```bash
+tensorboard --logdir logs/stage1_sct_v5 --port 6006
+```
+
+Stage 1记录`Train`和`Val`两套指标：总损失、image/laplacian/structural/residual
+四项raw loss、四项weighted loss、完整体积PSNR和学习率。`raw`表示损失函数原值，
+`weighted`表示乘以系数后对total loss的实际贡献。
+
 ## Stage 2：训练投影证据雕刻器
 
 ```bash
@@ -130,6 +146,23 @@ python -m src.train_stage2_sculptor \
 
 ```bash
 tensorboard --logdir logs/stage2_sculpt_finalview=6_v5 --port 6006
+```
+
+Stage 2记录：
+
+- `Loss/total`：总损失；
+- `Loss/raw/*`：image、laplacian、structural、preserve、gate、residual原值；
+- `Loss/weighted/*`：上述六项乘系数后的贡献；
+- `Metrics/PSNR_base`：冻结Stage 1基底B的PSNR；
+- `Metrics/PSNR_final`：投影雕刻后最终sCT的PSNR；
+- `Diagnostics/gate_mean`：体积内平均门控强度；
+- `Protocol/views`：当前训练课程使用的视角数；
+- `Optimizer/LR`：当前学习率。
+
+同时查看Stage 1和Stage 2可以直接指向总日志目录：
+
+```bash
+tensorboard --logdir logs --port 6006
 ```
 
 ## 推理

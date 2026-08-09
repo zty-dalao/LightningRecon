@@ -31,8 +31,12 @@ def _run_epoch(base_model, sculptor, loader, loss_fn, device,
     training = optimizer is not None
     base_model.eval()
     sculptor.train(training)
-    sums = {"loss": 0.0, "psnr": 0.0, "base_psnr": 0.0,
-            "gate": 0.0}
+    sums = {
+        "Loss/total": 0.0,
+        "Metrics/PSNR_final": 0.0,
+        "Metrics/PSNR_base": 0.0,
+        "Diagnostics/gate_mean": 0.0,
+    }
     cases = 0
     for batch in loader:
         cbct = batch["cbct"].to(device, non_blocking=True)
@@ -59,12 +63,20 @@ def _run_epoch(base_model, sculptor, loader, loss_fn, device,
             scaler.step(optimizer)
             scaler.update()
         n = cbct.shape[0]
-        sums["loss"] += float(losses["total"].detach()) * n
-        sums["psnr"] += float(volume_psnr_per_case(
+        sums["Loss/total"] += float(losses["total"].detach()) * n
+        sums["Metrics/PSNR_final"] += float(volume_psnr_per_case(
             outputs["final_sct"].detach(), ct
         ).sum())
-        sums["base_psnr"] += float(volume_psnr_per_case(base_sct, ct).sum())
-        sums["gate"] += float(outputs["evidence_gate"].detach().mean()) * n
+        sums["Metrics/PSNR_base"] += float(
+            volume_psnr_per_case(base_sct, ct).sum()
+        )
+        sums["Diagnostics/gate_mean"] += float(
+            outputs["evidence_gate"].detach().mean()
+        ) * n
+        for group in ("raw", "weighted"):
+            for name, value in losses[group].items():
+                key = f"Loss/{group}/{name}"
+                sums[key] = sums.get(key, 0.0) + float(value.detach()) * n
         cases += n
     return {key: value / cases for key, value in sums.items()}
 
@@ -160,12 +172,13 @@ def train(args):
             writer.add_scalar(f"Train/{key}", value, epoch)
         for key, value in val_result.items():
             writer.add_scalar(f"Val_finalview={args.final_view}/{key}", value, epoch)
-        writer.add_scalar("Train/views", current_views, epoch)
-        writer.add_scalar("Train/lr", optimizer.param_groups[0]["lr"], epoch)
+        writer.add_scalar("Train/Protocol/views", current_views, epoch)
+        writer.add_scalar("Train/Optimizer/LR", optimizer.param_groups[0]["lr"], epoch)
+        val_psnr = val_result["Metrics/PSNR_final"]
         payload = {
             "model": sculptor.state_dict(), "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(), "scaler": scaler.state_dict(),
-            "epoch": epoch, "best_psnr": max(best_psnr, val_result["psnr"]),
+            "epoch": epoch, "best_psnr": max(best_psnr, val_psnr),
             "stage1_checkpoint": str(Path(args.stage1_checkpoint).resolve()),
             "model_config": {
                 "base_channels": args.base_channels,
@@ -175,14 +188,14 @@ def train(args):
             "schedule": schedule, "args": vars(args),
         }
         torch.save(payload, run_dir / "stage2_last.pth")
-        if val_result["psnr"] > best_psnr:
-            best_psnr = val_result["psnr"]
+        if val_psnr > best_psnr:
+            best_psnr = val_psnr
             torch.save(payload, run_dir / "stage2_best.pth")
         print(
             f"[Stage2 {epoch + 1:03d}/{total_epochs} views={current_views}] "
-            f"loss={train_result['loss']:.5f} "
-            f"valPSNR={val_result['psnr']:.2f}dB "
-            f"base={val_result['base_psnr']:.2f}dB"
+            f"loss={train_result['Loss/total']:.5f} "
+            f"valPSNR={val_psnr:.2f}dB "
+            f"base={val_result['Metrics/PSNR_base']:.2f}dB"
         )
     writer.close()
 
