@@ -322,6 +322,9 @@ Phase C 的输入/隐藏投影闭环权重分别为 Stage 1 `0.004/0.002`、Stag
 约占total的5%。实际占比由 `Train/Loss/diagnostic/projection_fraction` 和
 `Val/projection_fraction`直接监控，主体仍是CT图像与结构监督。
 
+Phase A码本坍塌的尚未实现项、触发条件和建议实验顺序见
+[`CODEBOOK_COLLAPSE_TODO.md`](CODEBOOK_COLLAPSE_TODO.md)。
+
 `--volume_source ct`训练的Phase B会把配准残差、采集时相差异和实测噪声也
 吸收到映射中；它与Phase C的CT风格输出更匹配，但不是理想无噪声物理投影器，
 应与默认CBCT版本使用相同split和seed进行消融比较。
