@@ -31,6 +31,49 @@ def uniform_view_indices(total_views, n_views):
     return tuple(k * total_views // n_views for k in range(n_views))
 
 
+def nested_view_indices(
+    total_views,
+    base_views,
+    n_views,
+    final_view,
+    *,
+    random_extra=False,
+    rng=None,
+):
+    """从固定均匀基准集中选择嵌套子集，并永久保留最终部署视角。
+
+    例如 ``base_views=60, final_view=6`` 时，先从病例的全部有效投影中
+    均匀建立60-view基准集；6个等间隔部署视角是该基准集的固定锚点。
+    54/48/...阶段只在其余54个位置中补充视角，因此课程变化不会丢掉
+    最终部署时真正使用的测量方向。
+    """
+    if not (0 < final_view <= n_views <= base_views <= total_views):
+        raise ValueError(
+            "需要满足 0 < final_view <= n_views <= base_views <= total_views，"
+            f"实际为 {final_view}, {n_views}, {base_views}, {total_views}"
+        )
+    if base_views % final_view:
+        raise ValueError("base_views 必须能被 final_view 整除")
+
+    base_source = uniform_view_indices(total_views, base_views)
+    anchors = set(uniform_view_indices(base_views, final_view))
+    candidates = [i for i in range(base_views) if i not in anchors]
+    extra_count = n_views - final_view
+    if random_extra and extra_count:
+        if rng is None:
+            import numpy as np
+            rng = np.random
+        extras = rng.choice(candidates, size=extra_count, replace=False)
+        chosen = sorted(anchors.union(int(i) for i in extras))
+    else:
+        extra_positions = uniform_view_indices(len(candidates), extra_count) \
+            if extra_count else ()
+        chosen = sorted(
+            anchors.union(candidates[position] for position in extra_positions)
+        )
+    return tuple(base_source[position] for position in chosen)
+
+
 def resolve_view_curriculum(final_view, override=None, max_views=64):
     """解析并校验从高视角到 ``final_view`` 的训练课程。
 

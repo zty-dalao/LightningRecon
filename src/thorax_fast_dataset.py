@@ -24,7 +24,11 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 
-from src.view_protocol import resolve_view_curriculum, uniform_view_indices
+from src.view_protocol import (
+    nested_view_indices,
+    resolve_view_curriculum,
+    uniform_view_indices,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -122,8 +126,8 @@ class ThoraxFastDataset(Dataset):
         final_view: projection_views=None 时用于选择内置6/8/10-view课程。
         projection_size: 模型使用的投影 ``(H,W)``。
         projection_clip: 对数衰减固定归一化范围；默认映射 [0,10] 到 [-1,1]。
-        projection_sampling: ``uniform`` 用于基准集/验证，``random`` 用于
-            Phase B 在每次读取时随机选择真实角度。
+        projection_sampling: ``uniform/random``直接从源投影选择；
+            ``nested_uniform/nested_random``从固定基准集选择并保留最终锚点。
         volume_size: 期望的训练体积尺寸；不匹配时直接报错，不做隐式插值。
         drop_duplicate_endpoint: 去除 -π/+π 这种同方向周期端点。
         require_projections: CT 先验预训练可设 False；重建和投影器训练设 True。
@@ -141,6 +145,7 @@ class ThoraxFastDataset(Dataset):
         projection_size: tuple[int, int] = (128, 128),
         projection_clip: tuple[float, float] = (0.0, 10.0),
         projection_sampling: str = "uniform",
+        projection_base_views: int | None = None,
         volume_size: tuple[int, int, int] = (256, 256, 256),
         drop_duplicate_endpoint: bool = True,
         require_projections: bool = True,
@@ -164,9 +169,12 @@ class ThoraxFastDataset(Dataset):
             raise ValueError("projection_size 和 volume_size 的各维必须为正数")
         if projection_clip[0] >= projection_clip[1]:
             raise ValueError("projection_clip 必须严格递增")
-        if projection_sampling not in {"uniform", "random"}:
+        if projection_sampling not in {
+            "uniform", "random", "nested_uniform", "nested_random"
+        }:
             raise ValueError(
-                "projection_sampling 只能是 'uniform' 或 'random'"
+                "projection_sampling 必须是 uniform/random/"
+                "nested_uniform/nested_random 之一"
             )
 
         self.projection_views = int(projection_views)
@@ -174,6 +182,17 @@ class ThoraxFastDataset(Dataset):
         self.projection_size = tuple(int(v) for v in projection_size)
         self.projection_clip = tuple(float(v) for v in projection_clip)
         self.projection_sampling = projection_sampling
+        self.projection_base_views = (
+            int(projection_base_views)
+            if projection_base_views is not None else None
+        )
+        if self.projection_sampling.startswith("nested"):
+            if self.projection_base_views is None:
+                raise ValueError("nested采样必须提供 projection_base_views")
+            if self.projection_views == -1:
+                raise ValueError("nested采样不支持 projection_views=-1")
+            if self.projection_base_views < self.projection_views:
+                raise ValueError("projection_base_views不能小于当前视角数")
         self.volume_size = tuple(int(v) for v in volume_size)
         self.drop_duplicate_endpoint = bool(drop_duplicate_endpoint)
         self.require_projections = bool(require_projections)
@@ -214,6 +233,17 @@ class ThoraxFastDataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.cases)
+
+    def set_projection_views(self, projection_views: int) -> None:
+        """训练课程切换时更新当前视角数；DataLoader无需重建。"""
+        projection_views = int(projection_views)
+        upper = self.projection_base_views or projection_views
+        if not (self.final_view <= projection_views <= upper):
+            raise ValueError(
+                f"projection_views应在[{self.final_view},{upper}]，"
+                f"实际{projection_views}"
+            )
+        self.projection_views = projection_views
 
     def _load_volume(self, case: str, key: str) -> tuple[torch.Tensor, dict]:
         """读取 uint8 NIfTI，并从 (X,Y,Z) 转换成模型的 (D,H,W)。"""
@@ -286,7 +316,23 @@ class ThoraxFastDataset(Dataset):
             raise ValueError(
                 f"{case}: 请求 {n_keep} views，但只有 {valid_count} 个有效方向"
             )
-        if self.projection_sampling == "random" and n_keep < valid_count:
+        if self.projection_sampling.startswith("nested"):
+            if self.projection_base_views > valid_count:
+                raise ValueError(
+                    f"{case}: 基准集请求{self.projection_base_views} views，"
+                    f"但只有{valid_count}个有效方向"
+                )
+            indices = np.asarray(
+                nested_view_indices(
+                    valid_count,
+                    self.projection_base_views,
+                    n_keep,
+                    self.final_view,
+                    random_extra=self.projection_sampling == "nested_random",
+                ),
+                dtype=np.int64,
+            )
+        elif self.projection_sampling == "random" and n_keep < valid_count:
             # DataLoader worker 会继承独立 NumPy seed，因此多进程下仍可复现。
             indices = np.sort(
                 np.random.choice(valid_count, size=n_keep, replace=False)
@@ -326,7 +372,10 @@ class ThoraxFastDataset(Dataset):
             "projs_max": torch.tensor(
                 float(payload["projs_max"]), dtype=torch.float32
             ),
-            "base_views": torch.tensor(n_keep, dtype=torch.long),
+            "base_views": torch.tensor(
+                self.projection_base_views or n_keep, dtype=torch.long
+            ),
+            "selected_views": torch.tensor(n_keep, dtype=torch.long),
             "final_view": torch.tensor(self.final_view, dtype=torch.long),
         }
 

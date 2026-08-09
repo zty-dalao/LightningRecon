@@ -1,17 +1,7 @@
-"""
-损失函数: Charbonnier 图像损失 + 拉普拉斯金字塔 + 结构损失 + VQ 损失。
-
-L = w_img·L_img + w_lap·L_lap + w_struct·L_struct + w_vq·L_vq
-
-L_img:  Charbonnier (或 L1), 在完整体积上计算
-L_lap:  拉普拉斯金字塔分解，HF比HF, MF比MF
-L_struct: 梯度 L1 (边缘结构对齐 CT)
-L_vq:  码本学习 (commitment loss)
-"""
+"""新两阶段sCT模型共用的体素、频率、结构和SSIM函数。"""
 
 # 损失在 GPU 上使用 PyTorch 计算；SSIM 监控会显式转到 CPU/skimage。
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
 
@@ -136,62 +126,3 @@ def ssim_3d(img1, img2, data_range=1.0):
 def ssim_3d_per_case(img1, img2, data_range=1.0):
     """一次 skimage 调用返回逐病例完整体积 SSIM。"""
     return _skimage_ssim_3d(img1, img2, data_range)
-
-
-# =========================================================================
-# 组合损失 (支持三阶段不同权重)
-# =========================================================================
-
-class ReconstructionLoss(nn.Module):
-    """
-    L = w_img·L_img + w_lap·L_lap + w_struct·L_struct + w_vq·L_vq
-
-    所有图像与结构损失均在完整体积上计算。
-    """
-    def __init__(self, w_img=1.0, w_lap=0.05, w_struct=0.05, w_vq=0.05,
-                 lap_levels=2, charbonnier_eps=1e-3):
-        super().__init__()
-        self.w_img = w_img
-        self.w_lap = w_lap
-        self.w_struct = w_struct
-        self.w_vq = w_vq
-        self.lap_levels = lap_levels
-        self.charbonnier_eps = charbonnier_eps
-
-    def forward(self, pred, ct, vq_loss, compute_metrics=True):
-        """
-        pred: (B, 1, D, H, W)
-        ct:   (B, 1, D, H, W)
-        """
-        # 主损失约束整体强度，另外两项分别强调多尺度频率与局部边缘。
-        L_img = charbonnier_loss(pred, ct, self.charbonnier_eps)
-        L_lap = laplacian_pyramid_loss(pred, ct, self.lap_levels)
-        L_struct = structural_loss(pred, ct)
-        # 各阶段只改变权重，不改变损失的数学定义。
-        L_total = (self.w_img * L_img +
-                   self.w_lap * L_lap +
-                   self.w_struct * L_struct +
-                   self.w_vq * vq_loss)
-
-        # SSIM 只用于监控，不参与反向传播。
-        with torch.no_grad():
-            if compute_metrics:
-                ssim_val = ssim_3d_per_case(pred,ct).mean()
-            else:
-                ssim_val = pred.new_tensor(float('nan'))
-
-        return {
-            'total': L_total, 'img': L_img, 'lap': L_lap, 'struct': L_struct,
-            'vq': vq_loss, 'ssim': ssim_val,
-            'weighted_img': self.w_img * L_img,
-            'weighted_lap': self.w_lap * L_lap,
-            'weighted_struct': self.w_struct * L_struct,
-            'weighted_vq': self.w_vq * vq_loss,
-        }
-
-    def set_weights(self, w_img=None, w_lap=None, w_struct=None, w_vq=None):
-        """运行时动态调整损失权重 (用于阶段切换)"""
-        if w_img is not None: self.w_img = w_img
-        if w_lap is not None: self.w_lap = w_lap
-        if w_struct is not None: self.w_struct = w_struct
-        if w_vq is not None: self.w_vq = w_vq
