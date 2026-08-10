@@ -151,12 +151,16 @@ class ProjectionGuidedSculptor(nn.Module):
         x = self.up1(x, b1)
         features = self.up0(x, b0)
         residual = self.residual(features)
-        gate = torch.sigmoid(self.gate(features))
+        # 训练损失使用未经过sigmoid的logits，以便在AMP下调用数值稳定的
+        # binary_cross_entropy_with_logits；推理和残差融合仍使用[0,1] gate。
+        gate_logits = self.gate(features)
+        gate = torch.sigmoid(gate_logits)
         base_logits = torch.logit(base_sct.clamp(1e-4, 1.0 - 1e-4))
         final = torch.sigmoid(base_logits + gate * residual)
         return {
             "final_sct": final,
             "sculpt_residual": residual,
+            "evidence_gate_logits": gate_logits,
             "evidence_gate": gate,
             "evidence_mean": evidence_mean,
             "evidence_variance": evidence_variance,

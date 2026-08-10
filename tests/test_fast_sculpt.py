@@ -38,6 +38,7 @@ class FastSculptModelTest(unittest.TestCase):
         )
         self.assertEqual(outputs["final_sct"].shape, cbct.shape)
         self.assertEqual(outputs["evidence_gate"].shape, cbct.shape)
+        self.assertEqual(outputs["evidence_gate_logits"].shape, cbct.shape)
         loss = SculptingLoss()(
             outputs, base_outputs["base_sct"].detach(), ct
         )["total"]

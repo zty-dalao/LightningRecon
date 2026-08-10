@@ -50,8 +50,10 @@ class SculptingLoss(nn.Module):
             "laplacian": laplacian_pyramid_loss(final, target),
             "structural": structural_loss(final, target),
             "preserve": ((1.0 - gate_target) * modification).mean(),
-            "gate": F.binary_cross_entropy(
-                outputs["evidence_gate"].clamp(1e-5, 1 - 1e-5), gate_target
+            # BCEWithLogits把sigmoid和BCE合并计算，避免FP16下概率过早
+            # 饱和，也是PyTorch autocast明确支持的实现。
+            "gate": F.binary_cross_entropy_with_logits(
+                outputs["evidence_gate_logits"], gate_target
             ),
             "residual": (
                 outputs["evidence_gate"] * outputs["sculpt_residual"]
